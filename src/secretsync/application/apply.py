@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import anyio
 
@@ -55,6 +56,18 @@ class ApplySummary:
     skipped: int
 
 
+@dataclass(frozen=True, slots=True)
+class DestinationProgress:
+    """Value-free destination progress event for TUI / reporters."""
+
+    destination_id: str
+    connector: str
+    phase: Literal["started", "finished"]
+    applied: int = 0
+    failed: int = 0
+    skipped: int = 0
+
+
 @dataclass(slots=True)
 class ApplyReport:
     exit_code: int
@@ -68,6 +81,7 @@ class ApplyReport:
 
 
 ConfirmFn = Callable[[str], bool]
+ProgressFn = Callable[[DestinationProgress], None]
 
 
 def run_apply(
@@ -77,25 +91,36 @@ def run_apply(
     confirm: bool,
     max_concurrency: int,
     confirm_fn: ConfirmFn | None = None,
+    on_destination_progress: ProgressFn | None = None,
+    mutation_ids: frozenset[str] | None = None,
 ) -> ApplyReport:
     """Synchronous entry used by Click; runs the async coordinator."""
-    return anyio.run(
-        _run_apply_async,
-        services,
-        config_path,
-        confirm,
-        max_concurrency,
-        confirm_fn,
-    )
+
+    async def _runner() -> ApplyReport:
+        return await run_apply_async(
+            services,
+            config_path,
+            confirm=confirm,
+            max_concurrency=max_concurrency,
+            confirm_fn=confirm_fn,
+            on_destination_progress=on_destination_progress,
+            mutation_ids=mutation_ids,
+        )
+
+    return anyio.run(_runner)
 
 
-async def _run_apply_async(
+async def run_apply_async(
     services: AppServices,
     config_path: Path,
+    *,
     confirm: bool,
     max_concurrency: int,
-    confirm_fn: ConfirmFn | None,
+    confirm_fn: ConfirmFn | None = None,
+    on_destination_progress: ProgressFn | None = None,
+    mutation_ids: frozenset[str] | None = None,
 ) -> ApplyReport:
+    """Async apply entry used by the Textual TUI workers."""
     started = services.clock.now()
     validation = validate_config(services, config_path)
     if not validation.ok or validation.config is None:
@@ -137,6 +162,9 @@ async def _run_apply_async(
         )
 
     plan = build_plan(config, validation.composed_sets)
+    if mutation_ids is not None:
+        filtered = tuple(put for put in plan.puts if put.mutation_id in mutation_ids)
+        plan = Plan(strategy=plan.strategy, puts=filtered)
 
     if confirm:
         from secretsync.presentation.human import render_plan_human
@@ -153,8 +181,14 @@ async def _run_apply_async(
             )
 
     try:
-        blocks = await _apply_plan(services, config, plan, max_concurrency)
-    except anyio.get_cancelled_exc_class():
+        blocks = await _apply_plan(
+            services,
+            config,
+            plan,
+            max_concurrency,
+            on_destination_progress=on_destination_progress,
+        )
+    except (anyio.get_cancelled_exc_class(), asyncio.CancelledError):
         return ApplyReport(
             exit_code=EXIT_INTERRUPTED,
             strategy=plan.strategy,
@@ -247,6 +281,8 @@ async def _apply_plan(
     config: RootConfig,
     plan: Plan,
     max_concurrency: int,
+    *,
+    on_destination_progress: ProgressFn | None = None,
 ) -> list[DestinationApplyBlock]:
     by_destination: dict[str, list[PlannedPut]] = defaultdict(list)
     for put in plan.puts:
@@ -256,9 +292,30 @@ async def _apply_plan(
     results: dict[str, DestinationApplyBlock] = {}
 
     async def run_one(destination_id: str, puts: list[PlannedPut]) -> None:
+        connector_id = config.destinations[destination_id].connector
         async with limiter:
+            if on_destination_progress is not None:
+                on_destination_progress(
+                    DestinationProgress(
+                        destination_id=destination_id,
+                        connector=connector_id,
+                        phase="started",
+                    )
+                )
             block = await _apply_destination(services, config, destination_id, puts)
             results[destination_id] = block
+            if on_destination_progress is not None:
+                part = _summarize([block])
+                on_destination_progress(
+                    DestinationProgress(
+                        destination_id=destination_id,
+                        connector=connector_id,
+                        phase="finished",
+                        applied=part.applied,
+                        failed=part.failed,
+                        skipped=part.skipped,
+                    )
+                )
 
     async with anyio.create_task_group() as tg:
         for destination_id, puts in by_destination.items():

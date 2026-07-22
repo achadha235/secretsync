@@ -1,1 +1,5 @@
-"""Textual TUI package — full screens land in M5."""
+"""Textual TUI package."""
+
+from secretsync.tui.app import SecretSyncApp
+
+__all__ = ["SecretSyncApp"]
