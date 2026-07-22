@@ -103,6 +103,28 @@ class UnknownConnectorError(SecretSyncError):
         )
 
 
+class ConnectorNotImplementedError(SecretSyncError):
+    def __init__(self, connector_id: str) -> None:
+        super().__init__(
+            SafeError(
+                code="CONFIG_INVALID",
+                message=(f"Connector '{connector_id}' is recognized but not implemented yet"),
+                hint="GitHub Actions, Vercel, and SST land in M3/M4; use fake-* for M2.",
+            )
+        )
+
+
+class ConnectorValidationError(SecretSyncError):
+    def __init__(self, message: str, *, destination_id: str | None = None) -> None:
+        super().__init__(
+            SafeError(
+                code="DESTINATION_INVALID",
+                message=message,
+                destination_id=destination_id,
+            )
+        )
+
+
 # Stable exit codes from the Click contract (§3.4).
 EXIT_OK = 0
 EXIT_CONFIG = 2
@@ -118,6 +140,11 @@ ERROR_EXIT_CODES: dict[str, int] = {
     "SOURCE_MISSING": EXIT_MISSING_ENV,
     "SOURCE_EMPTY": EXIT_MISSING_ENV,
     "AUTH_MISSING": EXIT_MISSING_ENV,
+    "DESTINATION_INVALID": EXIT_CONNECTOR_VALIDATION,
+    "DESTINATION_PERMISSION_DENIED": EXIT_CONNECTOR_VALIDATION,
+    "DESTINATION_RATE_LIMITED": EXIT_PARTIAL,
+    "PROCESS_DESCRIPTOR_UNSUPPORTED": EXIT_CONFIG,
+    "PROCESS_FAILED": EXIT_PARTIAL,
 }
 
 
