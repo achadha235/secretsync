@@ -109,7 +109,7 @@ class ConnectorNotImplementedError(SecretSyncError):
             SafeError(
                 code="CONFIG_INVALID",
                 message=(f"Connector '{connector_id}' is recognized but not implemented yet"),
-                hint="GitHub Actions, Vercel, and SST land in M3/M4; use fake-* for M2.",
+                hint="Use fake-* for framework tests; all MVP providers are registered in M4+.",
             )
         )
 

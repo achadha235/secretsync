@@ -6,7 +6,7 @@ SecretSync is local-first: a vault runner such as `op run` injects values into t
 
 > Security: plaintext secrets move only through process memory, authenticated provider APIs, or inherited one-time pipes. Resolved values are never persisted in config, plans, logs, or temporary files.
 
-## Status (M0–M3)
+## Status (M0–M4)
 
 | Capability | Status |
 |---|---|
@@ -17,13 +17,14 @@ SecretSync is local-first: a vault runner such as `op run` injects values into t
 | Fake connectors (`fake-batch`, `fake-individual`) | Implemented |
 | GitHub Actions secrets (repo + environment) | Implemented (M3) |
 | Vercel env bulk upsert (`/v10/.../env?upsert=true`) | Implemented (M3) |
-| SST secure runner | Planned (M4) |
+| SST secure runner (env-file pipe + stdin set) | Implemented (M4) |
 | Textual TUI | Planned (M5) |
 
 ## Requirements
 
 - Python 3.12+
 - [uv](https://docs.astral.sh/uv/)
+- For SST apply: `sst` (preferred) or `bunx` on `PATH`, plus AWS credentials in the environment
 
 ## Setup
 
@@ -43,12 +44,15 @@ Configuration contains environment variable **names** (or vault references in a 
 
 op run --env-file=.env -- secretsync --config examples/secretsync.yaml validate
 op run --env-file=.env -- secretsync --config examples/secretsync.yaml plan
-op run --env-file=.env -- secretsync --config examples/secretsync.github-vercel.yaml apply --yes
+op run --env-file=.env -- secretsync --config examples/secretsync.yaml apply --yes
 ```
 
-`examples/secretsync.github-vercel.yaml` covers GitHub + Vercel only (SST lands in M4). The full three-destination example remains in `examples/secretsync.yaml`.
+`examples/secretsync.github-vercel.yaml` covers GitHub + Vercel only. The full three-destination example is `examples/secretsync.yaml`.
 
-Vercel writes affect **future** deployments only; SecretSync does not trigger a redeploy.
+**Provider notes**
+- Vercel writes affect **future** deployments only; SecretSync does not trigger a redeploy.
+- SST secret changes require a later `sst deploy` (unless `sst dev` is active); SecretSync does not deploy.
+- SST bulk load uses an inherited anonymous pipe (`/proc/self/fd/3` on Linux, `/dev/fd/3` on macOS) — never a plaintext temp file. On Windows, M4 uses per-secret `sst secret set` via stdin only.
 
 Without `op run`, export the required variables in your shell and run the same commands.
 Group options (`--config`, `--format`) must appear before the subcommand.
@@ -65,7 +69,7 @@ uv run secretsync --config tests/fixtures/fake_apply.yaml apply --yes
 ```bash
 export SECRETSYNC_SMOKE=1
 export GITHUB_TOKEN=... VERCEL_TOKEN=...
-# plus smoke-specific repo/project env vars documented in tests/smoke/
+# plus smoke-specific repo/project/stage env vars documented in tests/smoke/
 uv run pytest -m smoke
 ```
 
@@ -101,8 +105,9 @@ CI runs the same gates on every pull request via GitHub Actions (`.github/workfl
 src/secretsync/     application package
 examples/           sample secretsync.yaml
 tests/unit/         unit tests
-tests/integration/  respx HTTP connector tests
+tests/integration/  connector HTTP/process tests
 tests/contract/     destination protocol / batching contracts
+tests/security/     no-tempfile / canary process tests
 tests/smoke/        opt-in live provider checks
 tests/fixtures/     golden config and error fixtures
 ```

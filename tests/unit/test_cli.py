@@ -112,8 +112,8 @@ def test_connectors_list() -> None:
     assert "github-actions" in result.output
     assert "vercel" in result.output
     assert "sst" in result.output
-    assert result.output.count("[registered]") >= 4
-    assert "[planned]" in result.output
+    assert result.output.count("[registered]") >= 5
+    assert "[planned]" not in result.output
 
 
 def test_keyed_fingerprint_cli() -> None:
