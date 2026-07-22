@@ -5,7 +5,17 @@ build/
 dist/
 wheels/
 *.egg-info
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 # Virtual environments
 .venv
 .DS_Store
+
+# Local secrets / env (never commit resolved values)
+.env
+.env.*
+!.env.example

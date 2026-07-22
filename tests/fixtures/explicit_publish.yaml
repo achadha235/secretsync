@@ -1,0 +1,24 @@
+version: 1
+changeDetection: always-write
+secrets:
+  published:
+    env: PUBLISHED_ENV
+  unpublished:
+    env: UNPUBLISHED_ENV
+sets:
+  all:
+    include: [published, unpublished]
+destinations:
+  github:
+    connector: github-actions
+    repository: org/repo
+    auth:
+      tokenEnv: GITHUB_TOKEN
+deployments:
+  - name: only-published
+    set: all
+    destination: github
+    scope:
+      kind: repository
+    secrets:
+      published: PUBLISHED

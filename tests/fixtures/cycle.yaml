@@ -1,0 +1,26 @@
+version: 1
+changeDetection: always-write
+secrets:
+  a:
+    env: A_ENV
+sets:
+  parent:
+    extends: child
+    include: [a]
+  child:
+    extends: parent
+    include: [a]
+destinations:
+  github:
+    connector: github-actions
+    repository: org/repo
+    auth:
+      tokenEnv: GITHUB_TOKEN
+deployments:
+  - name: d1
+    set: child
+    destination: github
+    scope:
+      kind: repository
+    secrets:
+      a: A
