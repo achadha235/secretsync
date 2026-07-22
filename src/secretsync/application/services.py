@@ -9,7 +9,10 @@ from typing import Any
 
 from secretsync.config.loader import ConfigLoader
 from secretsync.destinations.fake import builtin_fake_factories
+from secretsync.destinations.github_actions import GitHubActionsFactory
 from secretsync.destinations.registry import ConnectorRegistry
+from secretsync.destinations.vercel import VercelFactory
+from secretsync.infrastructure.http import HttpClientFactory
 from secretsync.sources.environment import EnvironmentSource
 
 
@@ -17,14 +20,6 @@ from secretsync.sources.environment import EnvironmentSource
 class SystemClock:
     def now(self) -> datetime:
         return datetime.now(UTC)
-
-
-@dataclass(frozen=True, slots=True)
-class StubHttpClientFactory:
-    """HTTP clients arrive in M3; wire-logging must stay disabled when implemented."""
-
-    def create(self) -> Any:
-        raise NotImplementedError("HTTP client factory is implemented in M3")
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,19 +37,23 @@ class AppServices:
     connectors: ConnectorRegistry
     environ: Mapping[str, str]
     clock: SystemClock
-    http_client_factory: StubHttpClientFactory
+    http_client_factory: HttpClientFactory
     process_runner: StubProcessRunner
 
 
 def create_services(environ: Mapping[str, str]) -> AppServices:
     """Composition root. Click and Textual receive this object."""
-    factories: list[Any] = list(builtin_fake_factories())
+    factories: list[Any] = [
+        *builtin_fake_factories(),
+        GitHubActionsFactory(),
+        VercelFactory(),
+    ]
     return AppServices(
         config_loader=ConfigLoader(),
         source=EnvironmentSource(environ),
         connectors=ConnectorRegistry(factories),
         environ=environ,
         clock=SystemClock(),
-        http_client_factory=StubHttpClientFactory(),
+        http_client_factory=HttpClientFactory(),
         process_runner=StubProcessRunner(),
     )
