@@ -110,8 +110,10 @@ def test_connectors_list() -> None:
     assert "fake-batch" in result.output
     assert "fake-individual" in result.output
     assert "github-actions" in result.output
-    assert "registered" in result.output
-    assert "planned" in result.output
+    assert "vercel" in result.output
+    assert "sst" in result.output
+    assert result.output.count("[registered]") >= 4
+    assert "[planned]" in result.output
 
 
 def test_keyed_fingerprint_cli() -> None:

@@ -38,6 +38,9 @@ package = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+  "smoke: opt-in live provider tests (require SECRETSYNC_SMOKE=1 and credentials)",
+]
 
 [tool.ruff]
 line-length = 100

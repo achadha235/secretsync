@@ -6,7 +6,7 @@ SecretSync is local-first: a vault runner such as `op run` injects values into t
 
 > Security: plaintext secrets move only through process memory, authenticated provider APIs, or inherited one-time pipes. Resolved values are never persisted in config, plans, logs, or temporary files.
 
-## Status (M0 / M1 / M2)
+## Status (M0–M3)
 
 | Capability | Status |
 |---|---|
@@ -14,8 +14,10 @@ SecretSync is local-first: a vault runner such as `op run` injects values into t
 | Environment source | Implemented |
 | Click CLI shell | Implemented (`ui` stubbed until M5) |
 | Destination framework + apply coordinator | Implemented (M2) |
-| Fake connectors (`fake-batch`, `fake-individual`) | Implemented — prove connector-owned batching |
-| Real destinations (GitHub, Vercel, SST) | Planned (M3–M4) |
+| Fake connectors (`fake-batch`, `fake-individual`) | Implemented |
+| GitHub Actions secrets (repo + environment) | Implemented (M3) |
+| Vercel env bulk upsert (`/v10/.../env?upsert=true`) | Implemented (M3) |
+| SST secure runner | Planned (M4) |
 | Textual TUI | Planned (M5) |
 
 ## Requirements
@@ -41,18 +43,33 @@ Configuration contains environment variable **names** (or vault references in a 
 
 op run --env-file=.env -- secretsync --config examples/secretsync.yaml validate
 op run --env-file=.env -- secretsync --config examples/secretsync.yaml plan
-op run --env-file=.env -- secretsync --config examples/secretsync.yaml --format json plan
+op run --env-file=.env -- secretsync --config examples/secretsync.github-vercel.yaml apply --yes
 ```
 
-Apply against real GitHub/Vercel/SST destinations lands in M3/M4. Until then, exercise apply with the fake connectors:
+`examples/secretsync.github-vercel.yaml` covers GitHub + Vercel only (SST lands in M4). The full three-destination example remains in `examples/secretsync.yaml`.
+
+Vercel writes affect **future** deployments only; SecretSync does not trigger a redeploy.
+
+Without `op run`, export the required variables in your shell and run the same commands.
+Group options (`--config`, `--format`) must appear before the subcommand.
+
+### Fake connectors (framework demos)
 
 ```bash
 export YB_DATABASE_URL=... STRIPE_SECRET_KEY=... API_TOKEN=...
 uv run secretsync --config tests/fixtures/fake_apply.yaml apply --yes
 ```
 
-Without `op run`, export the required variables in your shell and run the same commands.
-Group options (`--config`, `--format`) must appear before the subcommand.
+### Opt-in provider smoke tests
+
+```bash
+export SECRETSYNC_SMOKE=1
+export GITHUB_TOKEN=... VERCEL_TOKEN=...
+# plus smoke-specific repo/project env vars documented in tests/smoke/
+uv run pytest -m smoke
+```
+
+Default CI runs `pytest` without smoke (no credentials required).
 
 ## Commands
 
@@ -84,7 +101,9 @@ CI runs the same gates on every pull request via GitHub Actions (`.github/workfl
 src/secretsync/     application package
 examples/           sample secretsync.yaml
 tests/unit/         unit tests
+tests/integration/  respx HTTP connector tests
 tests/contract/     destination protocol / batching contracts
+tests/smoke/        opt-in live provider checks
 tests/fixtures/     golden config and error fixtures
 ```
 

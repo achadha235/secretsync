@@ -69,11 +69,11 @@ def test_apply_partial_failure_exit_code() -> None:
     # Use a custom registry with a failing individual destination factory.
     from secretsync.application.services import (
         AppServices,
-        StubHttpClientFactory,
         StubProcessRunner,
         SystemClock,
     )
     from secretsync.config.loader import ConfigLoader
+    from secretsync.infrastructure.http import HttpClientFactory
     from secretsync.sources.environment import EnvironmentSource
 
     class FailingFactory(FakeIndividualFactory):
@@ -89,7 +89,7 @@ def test_apply_partial_failure_exit_code() -> None:
         connectors=ConnectorRegistry((FailingFactory(),)),
         environ=environ,
         clock=SystemClock(),
-        http_client_factory=StubHttpClientFactory(),
+        http_client_factory=HttpClientFactory(),
         process_runner=StubProcessRunner(),
     )
     report = run_apply(
