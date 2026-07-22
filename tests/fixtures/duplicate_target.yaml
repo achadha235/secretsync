@@ -1,0 +1,33 @@
+version: 1
+changeDetection: always-write
+secrets:
+  a:
+    env: A_ENV
+  b:
+    env: B_ENV
+sets:
+  s:
+    include: [a, b]
+destinations:
+  github:
+    connector: github-actions
+    repository: org/repo
+    auth:
+      tokenEnv: GITHUB_TOKEN
+deployments:
+  - name: d1
+    set: s
+    destination: github
+    scope:
+      kind: environment
+      environment: production
+    secrets:
+      a: SHARED_NAME
+  - name: d2
+    set: s
+    destination: github
+    scope:
+      kind: environment
+      environment: production
+    secrets:
+      b: SHARED_NAME

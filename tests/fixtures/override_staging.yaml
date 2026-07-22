@@ -1,0 +1,32 @@
+version: 1
+changeDetection: always-write
+secrets:
+  databaseUrl:
+    env: YB_DATABASE_URL
+  stripeSecretKey:
+    env: STRIPE_SECRET_KEY
+sets:
+  common:
+    include: [databaseUrl]
+  staging:
+    extends: common
+    include: [stripeSecretKey]
+    overrides:
+      databaseUrl:
+        env: YB_STAGING_DATABASE_URL
+        allowEmpty: true
+destinations:
+  github:
+    connector: github-actions
+    repository: org/repo
+    auth:
+      tokenEnv: GITHUB_TOKEN
+deployments:
+  - name: staging
+    set: staging
+    destination: github
+    scope:
+      kind: environment
+      environment: staging
+    secrets:
+      databaseUrl: DATABASE_URL
