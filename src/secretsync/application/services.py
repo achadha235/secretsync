@@ -11,8 +11,10 @@ from secretsync.config.loader import ConfigLoader
 from secretsync.destinations.fake import builtin_fake_factories
 from secretsync.destinations.github_actions import GitHubActionsFactory
 from secretsync.destinations.registry import ConnectorRegistry
+from secretsync.destinations.sst import SstFactory
 from secretsync.destinations.vercel import VercelFactory
 from secretsync.infrastructure.http import HttpClientFactory
+from secretsync.infrastructure.process import AsyncSecureProcessRunner
 from secretsync.sources.environment import EnvironmentSource
 
 
@@ -23,14 +25,6 @@ class SystemClock:
 
 
 @dataclass(frozen=True, slots=True)
-class StubProcessRunner:
-    """Secure process runner arrives in M4."""
-
-    async def execute(self, request: Any) -> Any:
-        raise NotImplementedError("Secure process runner is implemented in M4")
-
-
-@dataclass(frozen=True, slots=True)
 class AppServices:
     config_loader: ConfigLoader
     source: EnvironmentSource
@@ -38,7 +32,7 @@ class AppServices:
     environ: Mapping[str, str]
     clock: SystemClock
     http_client_factory: HttpClientFactory
-    process_runner: StubProcessRunner
+    process_runner: AsyncSecureProcessRunner
 
 
 def create_services(environ: Mapping[str, str]) -> AppServices:
@@ -47,6 +41,7 @@ def create_services(environ: Mapping[str, str]) -> AppServices:
         *builtin_fake_factories(),
         GitHubActionsFactory(),
         VercelFactory(),
+        SstFactory(),
     ]
     return AppServices(
         config_loader=ConfigLoader(),
@@ -55,5 +50,5 @@ def create_services(environ: Mapping[str, str]) -> AppServices:
         environ=environ,
         clock=SystemClock(),
         http_client_factory=HttpClientFactory(),
-        process_runner=StubProcessRunner(),
+        process_runner=AsyncSecureProcessRunner(),
     )

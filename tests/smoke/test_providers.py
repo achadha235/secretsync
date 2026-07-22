@@ -89,3 +89,40 @@ async def test_vercel_smoke_upsert() -> None:
         OperationContext(correlation_id="smoke-vc"),
     )
     assert result.results[0].status == "applied"
+
+
+@pytest.mark.asyncio
+async def test_sst_smoke_set() -> None:
+    if not _smoke_enabled():
+        pytest.skip("Set SECRETSYNC_SMOKE=1 with SECRETSYNC_SMOKE_SST_DIR")
+    workdir = os.environ.get("SECRETSYNC_SMOKE_SST_DIR")
+    stage = os.environ.get("SECRETSYNC_SMOKE_SST_STAGE", "development")
+    if not workdir:
+        pytest.skip("SECRETSYNC_SMOKE_SST_DIR required")
+
+    from secretsync.application.services import create_services
+    from secretsync.destinations.base import ApplyDestinationRequest, OperationContext, PutMutation
+    from secretsync.destinations.sst import SstFactory
+
+    services = create_services(dict(os.environ))
+    dest = SstFactory().create(services)
+    result = await dest.apply(
+        ApplyDestinationRequest(
+            deployment_id="smoke",
+            destination_config={
+                "connector": "sst",
+                "workingDirectory": workdir,
+                "executable": os.environ.get("SECRETSYNC_SMOKE_SST_EXECUTABLE", "sst"),
+            },
+            mutations=[
+                PutMutation(
+                    mutation_id="smoke:SECRETSYNC_SMOKE",
+                    name="SECRETSYNC_SMOKE",
+                    value=bytearray(b"smoke-ok"),
+                    scopes=({"stage": stage, "fallback": False},),
+                )
+            ],
+        ),
+        OperationContext(correlation_id="smoke-sst"),
+    )
+    assert result.results[0].status == "applied"

@@ -44,36 +44,28 @@ def test_apply_confirmation_declined() -> None:
     assert report.destinations == ()
 
 
-def test_apply_planned_connector_not_implemented() -> None:
-    services = create_services(
-        {
-            "YB_DATABASE_URL": "x",
-            "STRIPE_SECRET_KEY": "y",
-            "SENTRY_DSN": "z",
-            "GITHUB_TOKEN": "t",
-            "VERCEL_TOKEN": "v",
-        }
-    )
+def test_apply_unknown_connector_rejected() -> None:
+    services = create_services({"A_ENV": "x", "TOKEN_ENV": "t"})
     report = run_apply(
         services,
-        config_path=fixture_path("valid_full.yaml"),
+        config_path=fixture_path("unknown_connector.yaml"),
         confirm=False,
         max_concurrency=2,
     )
     assert report.exit_code == 2
     assert report.error is not None
-    assert "not implemented" in report.error.message.lower()
+    assert "unknown" in report.error.message.lower()
 
 
 def test_apply_partial_failure_exit_code() -> None:
     # Use a custom registry with a failing individual destination factory.
     from secretsync.application.services import (
         AppServices,
-        StubProcessRunner,
         SystemClock,
     )
     from secretsync.config.loader import ConfigLoader
     from secretsync.infrastructure.http import HttpClientFactory
+    from secretsync.infrastructure.process import AsyncSecureProcessRunner
     from secretsync.sources.environment import EnvironmentSource
 
     class FailingFactory(FakeIndividualFactory):
@@ -90,7 +82,7 @@ def test_apply_partial_failure_exit_code() -> None:
         environ=environ,
         clock=SystemClock(),
         http_client_factory=HttpClientFactory(),
-        process_runner=StubProcessRunner(),
+        process_runner=AsyncSecureProcessRunner(),
     )
     report = run_apply(
         services,
