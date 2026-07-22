@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from secretsync.application.apply import ApplyReport
 from secretsync.application.validate import ValidationResult
 from secretsync.domain.models import Plan
 
@@ -55,9 +56,65 @@ def plan_to_dict(plan: Plan) -> dict[str, Any]:
     }
 
 
+def apply_to_dict(report: ApplyReport) -> dict[str, Any]:
+    destinations: list[dict[str, Any]] = []
+    for block in report.destinations:
+        destinations.append(
+            {
+                "id": block.id,
+                "connector": block.connector,
+                "requestsMade": block.requests_made,
+                "results": [
+                    {
+                        "mutationId": result.mutation_id,
+                        "status": result.status,
+                        "effect": result.effect,
+                        "error": (
+                            None
+                            if result.error is None
+                            else {
+                                "code": result.error.code,
+                                "message": result.error.message,
+                                "hint": result.error.hint,
+                                "retryable": result.error.retryable,
+                                "correlationId": result.error.correlation_id,
+                            }
+                        ),
+                    }
+                    for result in block.results
+                ],
+            }
+        )
+    payload: dict[str, Any] = {
+        "schemaVersion": 1,
+        "strategy": report.strategy,
+        "startedAt": report.started_at.isoformat() if report.started_at else None,
+        "completedAt": report.completed_at.isoformat() if report.completed_at else None,
+        "summary": {
+            "applied": report.summary.applied,
+            "failed": report.summary.failed,
+            "skipped": report.summary.skipped,
+        },
+        "destinations": destinations,
+        "exitCode": report.exit_code,
+        "cancelled": report.cancelled,
+    }
+    if report.error is not None:
+        payload["error"] = {
+            "code": report.error.code,
+            "message": report.error.message,
+            "hint": report.error.hint,
+        }
+    return payload
+
+
 def render_validation_json(result: ValidationResult) -> str:
     return json.dumps(validation_to_dict(result), indent=2, sort_keys=True)
 
 
 def render_plan_json(plan: Plan) -> str:
     return json.dumps(plan_to_dict(plan), indent=2, sort_keys=True)
+
+
+def render_apply_json(report: ApplyReport) -> str:
+    return json.dumps(apply_to_dict(report), indent=2, sort_keys=True)

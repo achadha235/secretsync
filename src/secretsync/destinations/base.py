@@ -1,13 +1,17 @@
-"""Destination connector protocols and capability types (M2 stubs for M0/M1)."""
+"""Destination connector protocols, capabilities, and apply contracts."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Protocol
+from typing import Literal, Protocol
 
+from secretsync.domain.errors import SafeError
 from secretsync.domain.models import JsonValue
+
+# Spec alias: connector-facing errors are SafeError payloads.
+SafeConnectorError = SafeError
 
 
 class PutSemantics(StrEnum):
@@ -43,7 +47,56 @@ class DestinationManifest:
     capabilities: DestinationCapabilities
 
 
+@dataclass(frozen=True, slots=True)
+class Issue:
+    code: str
+    message: str
+    hint: str | None = None
+
+
+@dataclass(slots=True)
+class PutMutation:
+    mutation_id: str
+    name: str
+    value: bytearray
+    scopes: tuple[Mapping[str, JsonValue], ...]
+
+
+@dataclass(slots=True)
+class ApplyDestinationRequest:
+    deployment_id: str
+    destination_config: Mapping[str, JsonValue]
+    mutations: list[PutMutation]
+
+
+@dataclass(frozen=True, slots=True)
+class MutationResult:
+    mutation_id: str
+    status: Literal["applied", "failed", "skipped"]
+    effect: Literal["upserted", "created", "updated", "unknown"] | None = None
+    error: SafeConnectorError | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ApplyDestinationResult:
+    results: tuple[MutationResult, ...]
+    requests_made: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class OperationContext:
+    """Value-free context passed into connector apply calls."""
+
+    correlation_id: str
+
+
 class Destination(Protocol):
     manifest: DestinationManifest
 
-    async def validate(self, config: Mapping[str, JsonValue]) -> list[str]: ...
+    async def validate(self, config: Mapping[str, JsonValue]) -> list[Issue]: ...
+
+    async def apply(
+        self,
+        request: ApplyDestinationRequest,
+        context: OperationContext,
+    ) -> ApplyDestinationResult: ...

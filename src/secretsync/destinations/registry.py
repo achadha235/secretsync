@@ -1,4 +1,4 @@
-"""First-party connector registry (empty until M2/M3/M4)."""
+"""First-party connector registry."""
 
 from __future__ import annotations
 
@@ -6,17 +6,19 @@ from collections.abc import Iterable
 from typing import Any, Protocol
 
 from secretsync.destinations.base import Destination, DestinationManifest
-from secretsync.domain.errors import UnknownConnectorError
+from secretsync.domain.errors import ConnectorNotImplementedError, UnknownConnectorError
 
-# Known connector ids for offline config validation in M0/M1.
-# Factories are registered in later milestones.
-KNOWN_CONNECTOR_IDS: frozenset[str] = frozenset(
+# Planned real connectors (validated offline; factories arrive in M3/M4).
+PLANNED_CONNECTOR_IDS: frozenset[str] = frozenset(
     {
         "github-actions",
         "vercel",
         "sst",
     }
 )
+
+# Backward-compatible alias used by validate.
+KNOWN_CONNECTOR_IDS: frozenset[str] = PLANNED_CONNECTOR_IDS
 
 
 class DestinationFactory(Protocol):
@@ -27,34 +29,43 @@ class DestinationFactory(Protocol):
 
 class ConnectorRegistry:
     def __init__(self, builtins: Iterable[DestinationFactory] = ()) -> None:
-        self._factories = {factory.manifest.id: factory for factory in builtins}
+        self._factories: dict[str, DestinationFactory] = {
+            factory.manifest.id: factory for factory in builtins
+        }
 
     def known_ids(self) -> list[str]:
-        registered = sorted(self._factories)
-        if registered:
-            return registered
-        return sorted(KNOWN_CONNECTOR_IDS)
+        return sorted(set(self._factories) | set(PLANNED_CONNECTOR_IDS))
 
     def is_known(self, connector_id: str) -> bool:
-        return connector_id in self._factories or connector_id in KNOWN_CONNECTOR_IDS
+        return connector_id in self._factories or connector_id in PLANNED_CONNECTOR_IDS
+
+    def is_registered(self, connector_id: str) -> bool:
+        return connector_id in self._factories
 
     def create(self, connector_id: str, services: Any) -> Destination:
-        try:
-            return self._factories[connector_id].create(services)
-        except KeyError as exc:
-            raise UnknownConnectorError(connector_id) from exc
+        factory = self._factories.get(connector_id)
+        if factory is not None:
+            return factory.create(services)
+        if connector_id in PLANNED_CONNECTOR_IDS:
+            raise ConnectorNotImplementedError(connector_id)
+        raise UnknownConnectorError(connector_id)
 
     def list_manifests(self) -> list[dict[str, str]]:
-        if self._factories:
-            return [
-                {
-                    "id": factory.manifest.id,
-                    "version": factory.manifest.version,
-                    "status": "registered",
-                }
-                for factory in self._factories.values()
-            ]
-        return [
-            {"id": connector_id, "version": "0.0.0-planned", "status": "planned"}
-            for connector_id in sorted(KNOWN_CONNECTOR_IDS)
+        items: list[dict[str, str]] = [
+            {
+                "id": factory.manifest.id,
+                "version": factory.manifest.version,
+                "status": "registered",
+            }
+            for factory in sorted(self._factories.values(), key=lambda f: f.manifest.id)
         ]
+        for connector_id in sorted(PLANNED_CONNECTOR_IDS):
+            if connector_id not in self._factories:
+                items.append(
+                    {
+                        "id": connector_id,
+                        "version": "0.0.0-planned",
+                        "status": "planned",
+                    }
+                )
+        return items

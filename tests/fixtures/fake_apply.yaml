@@ -1,0 +1,36 @@
+version: 1
+changeDetection: always-write
+secrets:
+  databaseUrl:
+    env: YB_DATABASE_URL
+  stripeSecretKey:
+    env: STRIPE_SECRET_KEY
+  apiToken:
+    env: API_TOKEN
+sets:
+  app:
+    include: [databaseUrl, stripeSecretKey, apiToken]
+destinations:
+  batchSink:
+    connector: fake-batch
+    label: batch
+  individualSink:
+    connector: fake-individual
+    label: individual
+deployments:
+  - name: batch-prod
+    set: app
+    destination: batchSink
+    scope:
+      stage: production
+    secrets:
+      databaseUrl: DATABASE_URL
+      stripeSecretKey: STRIPE_SECRET_KEY
+  - name: individual-prod
+    set: app
+    destination: individualSink
+    scope:
+      stage: production
+    secrets:
+      databaseUrl: DATABASE_URL
+      apiToken: API_TOKEN

@@ -6,14 +6,16 @@ SecretSync is local-first: a vault runner such as `op run` injects values into t
 
 > Security: plaintext secrets move only through process memory, authenticated provider APIs, or inherited one-time pipes. Resolved values are never persisted in config, plans, logs, or temporary files.
 
-## Status (M0 / M1)
+## Status (M0 / M1 / M2)
 
 | Capability | Status |
 |---|---|
 | Config schema, compose, validate, plan | Implemented |
 | Environment source | Implemented |
-| Click CLI shell | Implemented (`apply` / `ui` stubbed until M2 / M5) |
-| Destination connectors | Planned (M2–M4) |
+| Click CLI shell | Implemented (`ui` stubbed until M5) |
+| Destination framework + apply coordinator | Implemented (M2) |
+| Fake connectors (`fake-batch`, `fake-individual`) | Implemented — prove connector-owned batching |
+| Real destinations (GitHub, Vercel, SST) | Planned (M3–M4) |
 | Textual TUI | Planned (M5) |
 
 ## Requirements
@@ -42,6 +44,13 @@ op run --env-file=.env -- secretsync --config examples/secretsync.yaml plan
 op run --env-file=.env -- secretsync --config examples/secretsync.yaml --format json plan
 ```
 
+Apply against real GitHub/Vercel/SST destinations lands in M3/M4. Until then, exercise apply with the fake connectors:
+
+```bash
+export YB_DATABASE_URL=... STRIPE_SECRET_KEY=... API_TOKEN=...
+uv run secretsync --config tests/fixtures/fake_apply.yaml apply --yes
+```
+
 Without `op run`, export the required variables in your shell and run the same commands.
 Group options (`--config`, `--format`) must appear before the subcommand.
 
@@ -51,7 +60,7 @@ Group options (`--config`, `--format`) must appear before the subcommand.
 |---|---|
 | `secretsync validate` | Parse, compose, check env presence; no remote writes |
 | `secretsync plan` | Value-free always-write plan |
-| `secretsync apply` | Destination apply (M2+) |
+| `secretsync apply` | Resolve values and apply via registered connectors |
 | `secretsync ui` | Textual UI (M5) |
 | `secretsync connectors` | List built-in connector IDs |
 
@@ -75,6 +84,7 @@ CI runs the same gates on every pull request via GitHub Actions (`.github/workfl
 src/secretsync/     application package
 examples/           sample secretsync.yaml
 tests/unit/         unit tests
+tests/contract/     destination protocol / batching contracts
 tests/fixtures/     golden config and error fixtures
 ```
 

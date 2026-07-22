@@ -14,8 +14,16 @@ from secretsync.application.plan import plan_from_path
 from secretsync.application.services import AppServices, create_services
 from secretsync.application.validate import validate_config
 from secretsync.domain.errors import EXIT_CONFIG, EXIT_OK
-from secretsync.presentation.human import render_plan_human, render_validation_human
-from secretsync.presentation.json import render_plan_json, render_validation_json
+from secretsync.presentation.human import (
+    render_apply_human,
+    render_plan_human,
+    render_validation_human,
+)
+from secretsync.presentation.json import (
+    render_apply_json,
+    render_plan_json,
+    render_validation_json,
+)
 
 
 @dataclass(slots=True)
@@ -82,32 +90,17 @@ def plan_cmd(ctx: AppContext) -> None:
 @click.option("--max-concurrency", type=click.IntRange(1, 32), default=4, show_default=True)
 @click.pass_obj
 def apply_cmd(ctx: AppContext, yes: bool, max_concurrency: int) -> None:
-    """Rebuild plan, resolve values, and apply (destination framework: M2+)."""
-    report = run_apply(ctx.services, confirm=not yes, max_concurrency=max_concurrency)
-    if report.error is not None:
-        if ctx.output_format == "json":
-            import json
-
-            click.echo(
-                json.dumps(
-                    {
-                        "schemaVersion": 1,
-                        "ok": False,
-                        "exitCode": report.exit_code,
-                        "error": {
-                            "code": report.error.code,
-                            "message": report.error.message,
-                            "hint": report.error.hint,
-                        },
-                    },
-                    indent=2,
-                    sort_keys=True,
-                )
-            )
-        else:
-            click.echo(f"[{report.error.code}] {report.error.message}", err=True)
-            if report.error.hint:
-                click.echo(f"hint: {report.error.hint}", err=True)
+    """Rebuild plan, resolve values, and apply destination mutations."""
+    report = run_apply(
+        ctx.services,
+        config_path=ctx.config_path,
+        confirm=not yes,
+        max_concurrency=max_concurrency,
+    )
+    if ctx.output_format == "json":
+        click.echo(render_apply_json(report))
+    else:
+        click.echo(render_apply_human(report))
     raise SystemExit(report.exit_code)
 
 
