@@ -107,14 +107,18 @@ def apply_cmd(ctx: AppContext, yes: bool, max_concurrency: int) -> None:
 @cli.command("ui")
 @click.pass_obj
 def ui_cmd(ctx: AppContext) -> None:
-    """Open Textual review/apply interface (implemented in M5)."""
-    del ctx
-    click.echo(
-        "Textual UI is not implemented yet (milestone M5). "
-        "Use secretsync validate and secretsync plan.",
-        err=True,
-    )
-    raise SystemExit(EXIT_CONFIG)
+    """Open Textual review/apply interface."""
+    if ctx.output_format == "json":
+        click.echo(
+            "JSON mode bypasses Textual; use: secretsync apply --yes --format json",
+            err=True,
+        )
+        raise SystemExit(EXIT_CONFIG)
+    from secretsync.tui.app import SecretSyncApp
+
+    app = SecretSyncApp(services=ctx.services, config_path=ctx.config_path)
+    report = app.run()
+    raise SystemExit(report.exit_code if report is not None else EXIT_OK)
 
 
 @cli.command("connectors")

@@ -97,10 +97,18 @@ def test_apply_cli_with_fakes() -> None:
         assert value not in result.output
 
 
-def test_ui_stub() -> None:
+def test_ui_json_format_rejected() -> None:
     runner = CliRunner()
-    result = runner.invoke(cli, ["ui"])
+    result = runner.invoke(cli, ["--format", "json", "ui"])
     assert result.exit_code == 2
+    assert "bypasses Textual" in result.output or "bypasses Textual" in (result.stderr or "")
+
+
+def test_ui_help_lists_command() -> None:
+    runner = CliRunner()
+    result = runner.invoke(cli, ["ui", "--help"])
+    assert result.exit_code == 0
+    assert "Textual" in result.output
 
 
 def test_connectors_list() -> None:
