@@ -54,7 +54,7 @@ Runs write a value-free trail under `.secretsync/audit.log` (gitignored).
 
 ## Learn more
 
-How the pieces fit together (including the SST env-file pipe): [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+How the pieces fit together (including the SST named-pipe env-file path): [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## License
 

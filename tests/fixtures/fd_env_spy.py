@@ -9,20 +9,21 @@ import sys
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) < 2:
+    if len(argv) < 3:
         return 2
     out = argv[1]
+    env_path = argv[2]
     keys = ("PATH", "HOME", "YB_DATABASE_URL", "STRIPE_SECRET_KEY")
     payload = {
         "argv": argv[2:],
         "env": {k: os.environ.get(k) for k in keys},
     }
-    # Also try to read fd 3 if present (optional)
+    # Drain the named pipe for length only — never echo contents.
     try:
-        with open("/proc/self/fd/3", "rb") as handle:
-            payload["fd3_len"] = len(handle.read())
+        with open(env_path, "rb") as handle:
+            payload["env_file_len"] = len(handle.read())
     except OSError:
-        payload["fd3_len"] = None
+        payload["env_file_len"] = None
     with open(out, "w", encoding="utf-8") as handle:
         json.dump(payload, handle)
     return 0

@@ -1,6 +1,6 @@
 # SecretSync architecture
 
-This document describes how SecretSync is structured and how secrets move — especially the SST **env-file pipe**.
+This document describes how SecretSync is structured and how secrets move — especially the SST **named-pipe** bulk path.
 
 ## Context
 
@@ -67,40 +67,37 @@ Connectors own batching and provider adaptation. The coordinator groups mutation
 
 Capabilities are declared in manifests and checked by contract tests.
 
-## Env-file pipe (SST bulk path)
+## Named pipe (SST bulk path)
 
-Goal: deliver many secrets to `sst secret load` without writing a dotenv file to disk and without putting values on argv.
+Goal: deliver many secrets to `sst secret load` without writing a dotenv tempfile to disk and without putting values on argv.
 
 ```text
+  TemporaryDirectory + os.mkfifo(.env)
+           |
+           |  writer thread opens FIFO (blocks until reader)
+           v
   stream_dotenv(variables, write)
            |
            v
-  anonymous pipe  (write end in parent)
-           |
-           |  parent maps read end onto fd 3, pass_fds=(3,)
-           v
-  child inherits fd 3
-           |
-           v
-  sst secret load /proc/self/fd/3   (or /dev/fd/3)
+  sst secret load <pipe_path>   ({env_file} substituted at spawn)
 ```
 
 ### Components
 
 1. **[`infrastructure/dotenv.py`](../src/secretsync/infrastructure/dotenv.py)** — streams `KEY="quoted"` chunks to a write callback. Rejects bad keys / NUL. Does not keep a combined mega-string for logging.
-2. **[`infrastructure/process.py`](../src/secretsync/infrastructure/process.py)** — `AsyncSecureProcessRunner` creates `os.pipe()`, remaps the read end to fd **3** in the parent before spawn (because `preexec_fn` + `close_fds` would close fd 3 if it is not in `pass_fds`), streams dotenv, closes the write end (EOF), awaits with timeout.
-3. **[`destinations/sst.py`](../src/secretsync/destinations/sst.py)** — partitions by `(cwd, stage, fallback)`. If `n >= 2` and descriptor probe OK → `secret load <fd-path>`; else per-mutation `secret set` with value on **stdin**.
+2. **[`infrastructure/process.py`](../src/secretsync/infrastructure/process.py)** — `AsyncSecureProcessRunner` creates a mode-`0700` temp dir + `mkfifo`, starts a background writer thread, substitutes `{env_file}` in argv, spawns the child (no fd inheritance), joins the writer, cleans up the temp dir.
+3. **[`destinations/sst.py`](../src/secretsync/destinations/sst.py)** — partitions by `(cwd, stage, fallback)`. If `n >= 2` and named-pipe probe OK → `secret load {env_file}`; else per-mutation `secret set` with value on **stdin**.
 
 ### Guarantees
 
-- No plaintext tempfile / FIFO for env files
+- No plaintext dotenv tempfile (FIFO inode only; payload never hits disk)
 - Minimal child env (no source secrets from parent)
 - Stderr summaries redact known secret strings
 - Probe uses a non-secret fixture reader, never production SST
 
 ### Fallback
 
-When the probe fails (e.g. `bunx` drops fd 3) or `n < 2`, SST uses stdin set. Windows documents set-only.
+When the probe fails (`mkfifo` unavailable) or `n < 2`, SST uses stdin set. Windows documents set-only.
 
 See security tests: [`tests/security/test_envfile_pipe.py`](../tests/security/test_envfile_pipe.py).
 
@@ -119,7 +116,7 @@ See security tests: [`tests/security/test_envfile_pipe.py`](../tests/security/te
 | Unit | `tests/unit/` | compose, plan, dotenv, process, presentation, TUI Pilot |
 | Contract | `tests/contract/` | protocol + capabilities |
 | Integration | `tests/integration/` | mocked GitHub/Vercel; SST doubles |
-| Security | `tests/security/` | canaries, env-file pipe, no tempfile |
+| Security | `tests/security/` | canaries, named-pipe env-file, no plaintext tempfile |
 | Smoke | `tests/smoke/` | opt-in live providers |
 
 Coverage gate: `--cov=secretsync --cov-fail-under=80`.

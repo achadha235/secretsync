@@ -6,12 +6,12 @@ from pathlib import Path
 import pytest
 
 from secretsync.infrastructure.process import (
+    ENV_FILE_PLACEHOLDER,
     AsyncSecureProcessRunner,
     EnvFileInput,
     SecureProcessRequest,
     build_minimal_child_env,
-    preferred_fd_path,
-    probe_env_file_descriptor,
+    probe_env_file_pipe,
 )
 
 FD_READER = Path(__file__).resolve().parents[1] / "fixtures" / "fd_reader.py"
@@ -23,11 +23,10 @@ async def test_env_file_pipe_delivers_bytes(tmp_path: Path) -> None:
     runner = AsyncSecureProcessRunner()
     request = SecureProcessRequest(
         executable=Path(sys.executable),
-        arguments=(str(FD_READER), preferred_fd_path()),
+        arguments=(str(FD_READER), ENV_FILE_PLACEHOLDER),
         cwd=tmp_path,
         environment=build_minimal_child_env({"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)}),
         env_file=EnvFileInput(variables={"CANARY": CANARY}),
-        timeout_seconds=10.0,
     )
     result = await runner.execute(request)
     assert result.exit_code == 0
@@ -38,9 +37,9 @@ async def test_env_file_pipe_delivers_bytes(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_probe_env_file_descriptor(tmp_path: Path) -> None:
+async def test_probe_env_file_pipe(tmp_path: Path) -> None:
     runner = AsyncSecureProcessRunner()
-    ok = await probe_env_file_descriptor(
+    ok = await probe_env_file_pipe(
         runner,
         reader_executable=Path(sys.executable),
         reader_args=(str(FD_READER),),

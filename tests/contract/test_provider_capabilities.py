@@ -23,13 +23,13 @@ def test_vercel_capabilities_batch() -> None:
     assert manifest.capabilities.delete_batch.supported is True
 
 
-def test_sst_capabilities_env_file_pipe() -> None:
+def test_sst_capabilities_named_pipe() -> None:
     from secretsync.destinations.sst import SstFactory
 
     manifest = SstFactory().manifest
     assert manifest.id == "sst"
     assert manifest.capabilities.put_batch.supported is True
-    assert manifest.capabilities.put_batch.transport == "env-file-pipe"
+    assert manifest.capabilities.put_batch.transport == "named-pipe"
     assert manifest.capabilities.multiple_scopes_per_mutation is False
     assert manifest.capabilities.list_names is True
     assert manifest.capabilities.delete_batch.supported is True

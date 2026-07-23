@@ -13,6 +13,7 @@ from secretsync.destinations.base import (
 )
 from secretsync.destinations.sst import SstDestination, SstFactory
 from secretsync.infrastructure.process import (
+    ENV_FILE_PLACEHOLDER,
     AsyncSecureProcessRunner,
     ProcessResult,
     SecureProcessRequest,
@@ -79,6 +80,7 @@ async def test_bulk_load_when_multiple_and_probe_ok(tmp_path: Path) -> None:
     call = runner.calls[0]
     assert call.env_file is not None
     assert "secret" in call.arguments and "load" in call.arguments
+    assert ENV_FILE_PLACEHOLDER in call.arguments
     assert "--stage" in call.arguments
     assert "production" in call.arguments
     assert "SECRET_CANARY_sst" not in repr(result)

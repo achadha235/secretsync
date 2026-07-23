@@ -1,4 +1,4 @@
-"""Security + correctness for streaming dotenv and inherited fd-3 env-file pipes."""
+"""Security + correctness for streaming dotenv and named-pipe env-file delivery."""
 
 from __future__ import annotations
 
@@ -16,13 +16,13 @@ from secretsync.infrastructure.dotenv import (
     validate_dotenv_key,
 )
 from secretsync.infrastructure.process import (
+    ENV_FILE_PLACEHOLDER,
     AsyncSecureProcessRunner,
     EnvFileInput,
     ProcessRunnerError,
     SecureProcessRequest,
     build_minimal_child_env,
-    preferred_fd_path,
-    probe_env_file_descriptor,
+    probe_env_file_pipe,
 )
 from tests.security.conftest import (
     CANARY,
@@ -68,7 +68,7 @@ async def test_envfile_pipe_roundtrip_hash(tmp_path: Path) -> None:
     result = await runner.execute(
         SecureProcessRequest(
             executable=Path(sys.executable),
-            arguments=(str(FD_HASH), preferred_fd_path()),
+            arguments=(str(FD_HASH), ENV_FILE_PLACEHOLDER),
             cwd=tmp_path,
             environment=_child_env(tmp_path),
             env_file=EnvFileInput(variables=variables),
@@ -78,11 +78,8 @@ async def test_envfile_pipe_roundtrip_hash(tmp_path: Path) -> None:
     assert result.exit_code == 0
     assert_canary_absent(result.stderr_summary)
     assert_no_canary_under(tmp_path)
-    # Child printed only length+hash; re-run capture via another reader that writes meta to file
-    # Hash is computed in-process against expected — child exit 0 proves bytes received.
-    # Cross-check by streaming again to hash locally.
     assert hashlib.sha256(expected).hexdigest() == digest
-    assert CANARY_BYTES not in " ".join((str(FD_HASH), preferred_fd_path())).encode()
+    assert CANARY_BYTES not in " ".join((str(FD_HASH), ENV_FILE_PLACEHOLDER)).encode()
 
 
 @pytest.mark.security
@@ -101,7 +98,7 @@ async def test_envfile_no_disk_no_argv_no_parent_secret_env(tmp_path: Path) -> N
     assert "STRIPE_SECRET_KEY" not in child_env
     assert child_env.get("AWS_ACCESS_KEY_ID") == "AKIAtest"
 
-    argv = (str(FD_SPY), str(spy_out), preferred_fd_path())
+    argv = (str(FD_SPY), str(spy_out), ENV_FILE_PLACEHOLDER)
     assert CANARY not in " ".join(argv)
 
     runner = AsyncSecureProcessRunner()
@@ -130,14 +127,14 @@ async def test_envfile_no_disk_no_argv_no_parent_secret_env(tmp_path: Path) -> N
 @pytest.mark.asyncio
 async def test_envfile_epipe_early_close_safe(tmp_path: Path) -> None:
     runner = AsyncSecureProcessRunner()
-    # Fill beyond typical pipe buffer so write fails after child closes fd 3.
+    # Fill beyond typical pipe buffer so write fails after child closes early.
     fat = CANARY_BYTES * 20_000
     variables = {f"K{i}": fat for i in range(4)}
     with pytest.raises(ProcessRunnerError) as exc_info:
         await runner.execute(
             SecureProcessRequest(
                 executable=Path(sys.executable),
-                arguments=(str(FIXTURES / "fd_close_fd3.py"),),
+                arguments=(str(FIXTURES / "fd_close_fd3.py"), ENV_FILE_PLACEHOLDER),
                 cwd=tmp_path,
                 environment=_child_env(tmp_path),
                 env_file=EnvFileInput(variables=variables),
@@ -159,7 +156,7 @@ async def test_envfile_timeout_kills_child(tmp_path: Path) -> None:
         await runner.execute(
             SecureProcessRequest(
                 executable=Path(sys.executable),
-                arguments=(str(FD_HANG), preferred_fd_path()),
+                arguments=(str(FD_HANG), ENV_FILE_PLACEHOLDER),
                 cwd=tmp_path,
                 environment=_child_env(tmp_path),
                 env_file=EnvFileInput(variables={"SECRET": CANARY_BYTES}),
@@ -174,9 +171,6 @@ async def test_envfile_timeout_kills_child(tmp_path: Path) -> None:
 @pytest.mark.security
 @pytest.mark.asyncio
 async def test_envfile_stderr_echo_redacted(tmp_path: Path) -> None:
-    # Child writes canary to stderr after reading pipe
-    FIXTURES / "fd_reader.py"
-    # Use python -c that reads fd and prints canary to stderr
     code = (
         "import sys;"
         "p=sys.argv[1];d=open(p,'rb').read();"
@@ -187,7 +181,7 @@ async def test_envfile_stderr_echo_redacted(tmp_path: Path) -> None:
     result = await runner.execute(
         SecureProcessRequest(
             executable=Path(sys.executable),
-            arguments=("-c", code, preferred_fd_path()),
+            arguments=("-c", code, ENV_FILE_PLACEHOLDER),
             cwd=tmp_path,
             environment=_child_env(tmp_path),
             env_file=EnvFileInput(variables={"SECRET": CANARY_BYTES}),
@@ -203,9 +197,7 @@ async def test_envfile_stderr_echo_redacted(tmp_path: Path) -> None:
 async def test_stdin_set_never_puts_value_on_argv(tmp_path: Path) -> None:
     code = f"import sys;d=sys.stdin.buffer.read();sys.exit(0 if d==b'{CANARY}' else 1)"
     argv = ("-c", code)
-    assert CANARY.encode() not in str(argv[0]).encode()  # value not as separate argv
-    # Note: -c script contains canary by design for equality check — SST path omits value from argv.
-    # Simulate SST style: script does not embed canary; value only on stdin.
+    assert CANARY.encode() not in str(argv[0]).encode()
     code2 = "import sys;d=sys.stdin.buffer.read();sys.exit(0 if len(d)>0 else 1)"
     runner = AsyncSecureProcessRunner()
     result = await runner.execute(
@@ -226,7 +218,7 @@ async def test_stdin_set_never_puts_value_on_argv(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_probe_uses_non_secret_token(tmp_path: Path) -> None:
     runner = AsyncSecureProcessRunner()
-    ok = await probe_env_file_descriptor(
+    ok = await probe_env_file_pipe(
         runner,
         reader_executable=Path(sys.executable),
         reader_args=(str(FD_READER),),
@@ -243,7 +235,6 @@ def test_streaming_write_chunks_not_one_megastring() -> None:
     variables = {"K1": CANARY_BYTES, "K2": b"second"}
     stream_dotenv(variables, chunks.append)
     assert len(chunks) > 1
-    # No single chunk equals the full encoded document
     full = b"".join(chunks)
     assert full.count(b"\n") == 2
     assert all(c != full for c in chunks)
@@ -271,7 +262,6 @@ def test_dotenv_quoting_roundtrip_specials() -> None:
     raw = b'a\\b"c\nd\re\tf\x01g'
     quoted = quote_dotenv_value(raw)
     assert quoted.startswith(b'"') and quoted.endswith(b'"')
-    # Decoder for our dialect
     inner = quoted[1:-1].decode("utf-8")
     out: list[str] = []
     i = 0
@@ -293,25 +283,16 @@ def test_dotenv_quoting_roundtrip_specials() -> None:
 
 
 @pytest.mark.security
-def test_preferred_fd_path_platform() -> None:
-    path = preferred_fd_path()
-    assert path.endswith("/3")
-    assert path in {"/proc/self/fd/3", "/dev/fd/3"}
-
-
-@pytest.mark.security
 @pytest.mark.asyncio
 async def test_bulk_multi_key_one_pipe(tmp_path: Path) -> None:
     variables = {f"K{i}": f"{CANARY}-{i}".encode() for i in range(5)}
     expected = _encode_expected(variables)
     digest = hashlib.sha256(expected).hexdigest()
-    # Capture hash via fd_hash_reader stdout — runner discards stdout.
-    # Verify by local encode + successful exit of reader that requires non-empty body.
     runner = AsyncSecureProcessRunner()
     result = await runner.execute(
         SecureProcessRequest(
             executable=Path(sys.executable),
-            arguments=(str(FD_READER), preferred_fd_path()),
+            arguments=(str(FD_READER), ENV_FILE_PLACEHOLDER),
             cwd=tmp_path,
             environment=_child_env(tmp_path),
             env_file=EnvFileInput(variables=variables),

@@ -6,11 +6,11 @@ from pathlib import Path
 import pytest
 
 from secretsync.infrastructure.process import (
+    ENV_FILE_PLACEHOLDER,
     AsyncSecureProcessRunner,
     EnvFileInput,
     SecureProcessRequest,
     build_minimal_child_env,
-    preferred_fd_path,
 )
 
 FD_READER = Path(__file__).resolve().parents[1] / "fixtures" / "fd_reader.py"
@@ -20,7 +20,7 @@ CANARY = b"SECRET_CANARY_nofile_a9f731"
 @pytest.mark.asyncio
 async def test_canary_never_written_to_disk(tmp_path: Path) -> None:
     runner = AsyncSecureProcessRunner()
-    argv = (str(FD_READER), preferred_fd_path())
+    argv = (str(FD_READER), ENV_FILE_PLACEHOLDER)
     # Ensure canary is not in argv
     assert CANARY not in " ".join(argv).encode()
 

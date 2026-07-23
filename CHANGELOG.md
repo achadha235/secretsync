@@ -5,6 +5,7 @@ All notable changes to this project are documented in this file.
 ## Unreleased
 
 - Plan-time remote reconcile via `--prune`: list destination secret names, plan deletes for orphans (`remote − YAML`), apply puts then deletes. No local state file.
+- SST bulk sync via named FIFO (`mkfifo` + `{env_file}`) instead of inherited fd 3 / `/proc/self/fd/3`.
 
 ## 0.1.0 — MVP
 
@@ -17,8 +18,8 @@ First MVP release of SecretSync.
 - Environment source with presence/empty/NUL checks
 - Click CLI: `validate`, `plan`, `apply`, `ui`, `connectors`
 - Textual review/apply TUI (keyboard-first; never renders secret values)
-- Destinations: GitHub Actions (repo + environment), Vercel (`/v10/.../env?upsert=true`), SST (env-file pipe + stdin set)
-- Security canary suite; SST secrets via inherited fd 3 — never plaintext tempfiles
+- Destinations: GitHub Actions (repo + environment), Vercel (`/v10/.../env?upsert=true`), SST (named-pipe load + stdin set)
+- Security canary suite; SST secrets via named FIFO — never plaintext dotenv tempfiles
 
 ### Important semantics
 
