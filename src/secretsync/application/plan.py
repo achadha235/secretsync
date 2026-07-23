@@ -17,13 +17,22 @@ from secretsync.domain.errors import (
 from secretsync.domain.models import JsonValue, Plan, PlannedPut, TargetRef
 
 
-def build_plan(config: RootConfig, composed_sets: dict[str, ComposedSet]) -> Plan:
-    """Compile a value-free always-write plan."""
+def build_plan(
+    config: RootConfig,
+    composed_sets: dict[str, ComposedSet],
+    *,
+    deployments: set[str] | None = None,
+    destinations: set[str] | None = None,
+) -> Plan:
+    """Compile a value-free always-write plan (optionally filtered)."""
     if config.change_detection != "always-write":
         raise UnimplementedChangeDetectionError(config.change_detection)
 
+    from secretsync.application.selection import filter_deployments
+
+    selected = filter_deployments(config, deployments=deployments, destinations=destinations)
     puts: list[PlannedPut] = []
-    for deployment in config.deployments:
+    for deployment in selected:
         available = composed_sets[deployment.set]
         for logical_id, destination_name in deployment.secrets.items():
             source = available.require(logical_id)
@@ -68,13 +77,27 @@ def _json_value(value: Any) -> JsonValue:
 
 
 def plan_from_path(
-    services: AppServices, config_path: Path
+    services: AppServices,
+    config_path: Path,
+    *,
+    deployments: set[str] | None = None,
+    destinations: set[str] | None = None,
 ) -> tuple[Plan | None, ValidationResult]:
-    result = validate_config(services, config_path)
+    result = validate_config(
+        services,
+        config_path,
+        deployments=deployments,
+        destinations=destinations,
+    )
     if not result.ok or result.config is None:
         return None, result
     try:
-        plan = build_plan(result.config, result.composed_sets)
+        plan = build_plan(
+            result.config,
+            result.composed_sets,
+            deployments=deployments,
+            destinations=destinations,
+        )
         return plan, result
     except SecretSyncError as exc:
         result.issues.append(

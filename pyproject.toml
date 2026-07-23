@@ -9,7 +9,7 @@ authors = [{ name = "SecretSync contributors" }]
 requires-python = ">=3.12"
 keywords = ["secrets", "github-actions", "vercel", "sst", "1password", "cli"]
 classifiers = [
-  "Development Status :: 4 - Beta",
+  "Development Status :: 2 - Pre-Alpha",
   "Environment :: Console",
   "Intended Audience :: Developers",
   "License :: OSI Approved :: MIT License",
@@ -27,6 +27,7 @@ dependencies = [
   "httpx>=0.28,<1",
   "pynacl>=1.5,<2",
   "anyio>=4.9,<5",
+  "loguru>=0.7.3",
 ]
 
 [project.urls]

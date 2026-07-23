@@ -112,9 +112,3 @@ See security tests: [`tests/security/test_envfile_pipe.py`](../tests/security/te
 | Smoke | `tests/smoke/` | opt-in live providers |
 
 Coverage gate: `--cov=secretsync --cov-fail-under=80`.
-
-## Related docs
-
-- [THREAT_MODEL.md](THREAT_MODEL.md)
-- [APPENDIX_C_CHECKLIST.md](APPENDIX_C_CHECKLIST.md)
-- [SECURITY.md](../SECURITY.md)

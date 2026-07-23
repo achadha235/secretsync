@@ -33,9 +33,9 @@ def test_canary_apply_cli_human_json(tmp_path, monkeypatch) -> None:
         env=FAKE_ENV,
     )
     assert result.exit_code == 0
-    assert_canary_absent(result.output, label="json stdout")
+    assert_canary_absent(result.stdout, label="json stdout")
     assert_canary_absent(result.stderr or "", label="json stderr")
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert payload["summary"]["applied"] == 4
     assert_no_canary_under(tmp_path)
 
@@ -45,7 +45,7 @@ def test_canary_apply_cli_human_json(tmp_path, monkeypatch) -> None:
         env=FAKE_ENV,
     )
     assert human.exit_code == 0
-    assert_canary_absent(human.output, label="human stdout")
+    assert_canary_absent(human.stdout, label="human stdout")
     assert_canary_absent(human.stderr or "", label="human stderr")
 
 
