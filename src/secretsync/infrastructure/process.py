@@ -284,7 +284,8 @@ class AsyncSecureProcessRunner:
                             SafeConnectorError(code="DESTINATION_INVALID", message=str(err))
                         ) from err
                     if isinstance(err, BrokenPipeError) or (
-                        isinstance(err, OSError) and getattr(err, "errno", None) == getattr(os, "EPIPE", 32)
+                        isinstance(err, OSError)
+                        and getattr(err, "errno", None) == getattr(os, "EPIPE", 32)
                     ):
                         raise OSError(getattr(os, "EPIPE", 32), "EPIPE") from err
                     if isinstance(err, OSError):

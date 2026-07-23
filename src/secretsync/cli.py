@@ -53,9 +53,7 @@ def _configure_logging(*, verbose: bool, quiet: bool) -> None:
         level = "DEBUG"
     else:
         level = "INFO"
-    logger.add(
-        sys.stderr, level=level, format="{time:HH:mm:ss} | {level:<7} | {message}"
-    )
+    logger.add(sys.stderr, level=level, format="{time:HH:mm:ss} | {level:<7} | {message}")
 
 
 def _dep_set(ctx: AppContext) -> set[str] | None:
@@ -235,9 +233,7 @@ def plan_cmd(ctx: AppContext, prune: bool) -> None:
 
 @cli.command("apply")
 @click.option("--yes", is_flag=True, help="Skip interactive confirmation.")
-@click.option(
-    "--max-concurrency", type=click.IntRange(1, 32), default=4, show_default=True
-)
+@click.option("--max-concurrency", type=click.IntRange(1, 32), default=4, show_default=True)
 @click.option(
     "--prune",
     is_flag=True,
@@ -277,9 +273,7 @@ def apply_cmd(ctx: AppContext, yes: bool, max_concurrency: int, prune: bool) -> 
 @click.pass_obj
 def health_cmd(ctx: AppContext) -> None:
     """Check connector auth / reachability for env vars that are set."""
-    github_env, vercel_env = health_token_envs_from_config(
-        ctx.config_path, ctx.services.environ
-    )
+    github_env, vercel_env = health_token_envs_from_config(ctx.config_path, ctx.services.environ)
 
     async def _run() -> HealthReport:
         return await run_health(
