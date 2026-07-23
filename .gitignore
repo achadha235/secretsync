@@ -19,3 +19,7 @@ htmlcov/
 .env
 .env.*
 !.env.example
+
+# Agent / local tooling
+.testagent/
+secretsync-apply-report.json

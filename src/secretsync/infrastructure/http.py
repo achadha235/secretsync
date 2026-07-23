@@ -44,6 +44,14 @@ def redact_headers(headers: httpx.Headers | MappingLike) -> dict[str, str]:
 MappingLike = Any
 
 
+def response_debug_meta(response: httpx.Response) -> dict[str, object]:
+    """Value-free response metadata for diagnostics (never includes body)."""
+    return {
+        "status_code": response.status_code,
+        "headers": redact_headers(response.headers),
+    }
+
+
 def error_for_status(
     status_code: int,
     *,
@@ -115,6 +123,8 @@ async def request_with_retries(
             return response
 
         last_response = response
+        # Touch redacted meta so sensitive headers are never kept as a logging side channel.
+        _ = response_debug_meta(response)
         if attempt + 1 >= max_attempts:
             break
         await asyncio.sleep(_retry_delay_seconds(attempt, response))

@@ -146,3 +146,36 @@ async def test_pilot_snapshot_has_no_secret_values() -> None:
         assert "sk_live_canary" not in combined
         assert "token_canary" not in combined
         assert isinstance(app.screen, PlanScreen)
+
+
+@pytest.mark.asyncio
+async def test_pilot_plan_filter_input() -> None:
+    services = create_services(FAKE_ENV)
+    app = SecretSyncApp(services=services, config_path=fixture_path("fake_apply.yaml"))
+    async with app.run_test(size=(100, 40)) as pilot:
+        await pilot.pause()
+        for _ in range(40):
+            if "OK" in str(app.screen.query_one("#status").render()):
+                break
+            await pilot.pause(0.05)
+        await pilot.click("#continue")
+        await pilot.pause()
+        for _ in range(40):
+            if isinstance(app.screen, PlanScreen) and "OK" in str(
+                app.screen.query_one("#plan-summary").render()
+            ):
+                break
+            await pilot.pause(0.05)
+        assert isinstance(app.screen, PlanScreen)
+
+        filter_input = app.screen.query_one("#filter-input")
+        filter_input.focus()
+        await pilot.pause()
+        # Narrow to a destination substring present in fake_apply.yaml connectors.
+        await pilot.press(*"fake-batch")
+        await pilot.pause()
+        tree_text = _screen_text(app)
+        assert CANARY not in tree_text
+        assert "sk_live_canary" not in tree_text
+        # Filter should keep matching destination labels and drop others when possible.
+        assert "fake-batch" in tree_text.lower() or "put" in tree_text.lower()

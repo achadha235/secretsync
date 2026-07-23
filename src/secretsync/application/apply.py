@@ -369,9 +369,10 @@ async def _apply_destination(
             try:
                 outcome = await destination.apply(request, context)
             except Exception as exc:  # noqa: BLE001 — convert to safe per-mutation failures
+                secret_texts = [bytes(m.value).decode("utf-8", errors="replace") for m in mutations]
                 outcome = _failure_result_for_request(
                     request,
-                    message=sanitize_exception(exc),
+                    message=sanitize_exception(exc, secret_texts),
                     correlation_id=context.correlation_id,
                 )
             requests_made += outcome.requests_made
@@ -388,10 +389,13 @@ async def _apply_destination(
     )
 
 
-def sanitize_exception(exc: BaseException) -> str:
+def sanitize_exception(exc: BaseException, secrets: list[str] | None = None) -> str:
     from secretsync.infrastructure.redaction import sanitize_provider_message
 
-    return sanitize_provider_message(f"{type(exc).__name__}: connector raised")
+    return sanitize_provider_message(
+        f"{type(exc).__name__}: connector raised",
+        secrets,
+    )
 
 
 def _failure_result_for_request(
