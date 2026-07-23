@@ -67,7 +67,7 @@ jobs:
       - name: SHA256SUMS
         working-directory: dist
         run: |
-          sha256sum secretsync-*.whl secretsync-*.tar.gz > SHA256SUMS
+          sha256sum secretsync_cli-*.whl secretsync_cli-*.tar.gz > SHA256SUMS
           cat SHA256SUMS
 
       - name: Publish to PyPI

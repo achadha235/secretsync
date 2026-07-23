@@ -49,5 +49,5 @@ jobs:
       - name: Wheel import smoke
         shell: bash
         run: |
-          wheel=$(ls dist/secretsync-*.whl | head -1)
+          wheel=$(ls dist/secretsync_cli-*.whl | head -1)
           uv run --with "$wheel" --no-project secretsync --help
