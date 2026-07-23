@@ -30,12 +30,16 @@ class SecretSyncApp(App[ApplyReport | None]):
         *,
         max_concurrency: int = 4,
         prune: bool = False,
+        run_id: str | None = None,
     ) -> None:
+        from secretsync.infrastructure.audit import new_run_id
+
         super().__init__()
         self.services = services
         self.config_path = config_path.resolve()
         self.max_concurrency = max_concurrency
         self.prune = prune
+        self.run_id = run_id or new_run_id()
         self.plan: Plan | None = None
         self.report: ApplyReport | None = None
         self.retry_mutation_ids: frozenset[str] | None = None

@@ -39,6 +39,7 @@ from secretsync.domain.errors import (
     exit_code_for,
 )
 from secretsync.domain.models import JsonValue, Plan, PlannedDelete, PlannedPut
+from secretsync.infrastructure.audit import new_run_id, record_mutation_audit
 from secretsync.infrastructure.redaction import scrub_bytearray
 
 
@@ -97,6 +98,7 @@ def run_apply(
     deployments: set[str] | None = None,
     destinations: set[str] | None = None,
     prune: bool = False,
+    run_id: str | None = None,
 ) -> ApplyReport:
     """Synchronous entry used by Click; runs the async coordinator."""
 
@@ -112,6 +114,7 @@ def run_apply(
             deployments=deployments,
             destinations=destinations,
             prune=prune,
+            run_id=run_id,
         )
 
     return anyio.run(_runner)
@@ -129,6 +132,7 @@ async def run_apply_async(
     deployments: set[str] | None = None,
     destinations: set[str] | None = None,
     prune: bool = False,
+    run_id: str | None = None,
 ) -> ApplyReport:
     """Async apply entry used by the Textual TUI workers."""
     from loguru import logger
@@ -224,12 +228,15 @@ async def run_apply_async(
                 summary=ApplySummary(0, 0, len(plan.puts) + len(plan.deletes)),
             )
 
+    audit_run = run_id or new_run_id()
     try:
         blocks = await _apply_plan(
             services,
             config,
             plan,
             max_concurrency,
+            config_path=config_path,
+            run_id=audit_run,
             on_destination_progress=on_destination_progress,
         )
     except (anyio.get_cancelled_exc_class(), asyncio.CancelledError):
@@ -333,6 +340,8 @@ async def _apply_plan(
     plan: Plan,
     max_concurrency: int,
     *,
+    config_path: Path,
+    run_id: str,
     on_destination_progress: ProgressFn | None = None,
 ) -> list[DestinationApplyBlock]:
     puts_by_destination: dict[str, list[PlannedPut]] = defaultdict(list)
@@ -367,6 +376,8 @@ async def _apply_plan(
                 destination_id,
                 puts_by_destination.get(destination_id, []),
                 deletes_by_destination.get(destination_id, []),
+                config_path=config_path,
+                run_id=run_id,
             )
             results[destination_id] = block
             if on_destination_progress is not None:
@@ -395,6 +406,9 @@ async def _apply_destination(
     destination_id: str,
     puts: list[PlannedPut],
     deletes: list[PlannedDelete],
+    *,
+    config_path: Path,
+    run_id: str,
 ) -> DestinationApplyBlock:
     destination_def = config.destinations[destination_id]
     connector_id = destination_def.connector
@@ -458,7 +472,18 @@ async def _apply_destination(
                     correlation_id=context.correlation_id,
                 )
             requests_made += outcome.requests_made
-            all_results.extend(_correlate_results(request, outcome, context.correlation_id))
+            correlated = _correlate_results(request, outcome, context.correlation_id)
+            _audit_mutations(
+                config_path=config_path,
+                run_id=run_id,
+                destination_id=destination_id,
+                connector_id=connector_id,
+                deployment_id=deployment_id,
+                request=request,
+                results=correlated,
+                correlation_id=context.correlation_id,
+            )
+            all_results.extend(correlated)
         finally:
             for mutation in mutations:
                 scrub_bytearray(mutation.value)
@@ -469,6 +494,54 @@ async def _apply_destination(
         requests_made=requests_made,
         results=tuple(all_results),
     )
+
+
+def _audit_mutations(
+    *,
+    config_path: Path,
+    run_id: str,
+    destination_id: str,
+    connector_id: str,
+    deployment_id: str,
+    request: ApplyDestinationRequest,
+    results: list[MutationResult],
+    correlation_id: str,
+) -> None:
+    by_id = {r.mutation_id: r for r in results}
+    for mutation in request.mutations:
+        result = by_id[mutation.mutation_id]
+        scope = mutation.scopes[0] if mutation.scopes else {}
+        record_mutation_audit(
+            config_path=config_path,
+            run_id=run_id,
+            destination_id=destination_id,
+            connector_id=connector_id,
+            deployment_id=deployment_id,
+            op="put",
+            name=mutation.name,
+            scope=scope,
+            status=result.status,
+            effect=result.effect,
+            correlation_id=correlation_id,
+            error_code=result.error.code if result.error else None,
+        )
+    for deletion in request.deletes:
+        result = by_id[deletion.mutation_id]
+        scope = deletion.scopes[0] if deletion.scopes else {}
+        record_mutation_audit(
+            config_path=config_path,
+            run_id=run_id,
+            destination_id=destination_id,
+            connector_id=connector_id,
+            deployment_id=deployment_id,
+            op="delete",
+            name=deletion.name,
+            scope=scope,
+            status=result.status,
+            effect=result.effect,
+            correlation_id=correlation_id,
+            error_code=result.error.code if result.error else None,
+        )
 
 
 def sanitize_exception(exc: BaseException, secrets: list[str] | None = None) -> str:

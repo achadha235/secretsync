@@ -390,6 +390,7 @@ class ExecutionScreen(Screen[None]):
                 on_destination_progress=on_progress,
                 mutation_ids=app.retry_mutation_ids,
                 prune=app.prune,
+                run_id=app.run_id,
             )
         except Exception:  # noqa: BLE001 — map unexpected cancel/errors to interrupted report
             report = ApplyReport(

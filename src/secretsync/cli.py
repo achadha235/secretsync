@@ -18,7 +18,7 @@ from secretsync.application.selection import selection_extra
 from secretsync.application.services import AppServices, create_services
 from secretsync.application.validate import validate_config
 from secretsync.domain.errors import EXIT_CONFIG, EXIT_OK
-from secretsync.infrastructure.audit import record_audit
+from secretsync.infrastructure.audit import new_run_id, record_audit
 from secretsync.presentation.human import (
     render_apply_human,
     render_plan_human,
@@ -36,6 +36,7 @@ class AppContext:
     config_path: Path
     output_format: str
     services: AppServices
+    run_id: str
     deployments: tuple[str, ...] = ()
     destinations: tuple[str, ...] = ()
 
@@ -107,6 +108,7 @@ def cli(
         config_path=config,
         output_format=output_format,
         services=services,
+        run_id=new_run_id(),
         deployments=deployments,
         destinations=destinations,
     )
@@ -127,7 +129,13 @@ def init_cmd(ctx: AppContext) -> None:
             "Remove it or run init in an empty directory.",
             err=True,
         )
-        record_audit(command="init", config_path=yaml_path, exit_code=EXIT_CONFIG, cwd=cwd)
+        record_audit(
+            command="init",
+            config_path=yaml_path,
+            exit_code=EXIT_CONFIG,
+            cwd=cwd,
+            run_id=ctx.run_id,
+        )
         raise SystemExit(EXIT_CONFIG)
 
     yaml_path.write_text(SECRETSYNC_YAML, encoding="utf-8")
@@ -139,7 +147,13 @@ def init_cmd(ctx: AppContext) -> None:
         tpl_path.write_text(ENV_SECRETSYNC_TPL, encoding="utf-8")
         logger.info("Wrote {}", tpl_path)
         click.echo(f"Created {tpl_path.name}")
-    record_audit(command="init", config_path=yaml_path, exit_code=EXIT_OK, cwd=cwd)
+    record_audit(
+        command="init",
+        config_path=yaml_path,
+        exit_code=EXIT_OK,
+        cwd=cwd,
+        run_id=ctx.run_id,
+    )
     raise SystemExit(EXIT_OK)
 
 
@@ -162,6 +176,7 @@ def validate_cmd(ctx: AppContext) -> None:
         config_path=ctx.config_path if ctx.config_path.exists() else None,
         exit_code=result.exit_code,
         extra=selection_extra(ctx.deployments, ctx.destinations),
+        run_id=ctx.run_id,
     )
     raise SystemExit(result.exit_code)
 
@@ -192,6 +207,7 @@ def plan_cmd(ctx: AppContext, prune: bool) -> None:
             config_path=ctx.config_path if ctx.config_path.exists() else None,
             exit_code=result.exit_code,
             extra=selection_extra(ctx.deployments, ctx.destinations),
+            run_id=ctx.run_id,
         )
         raise SystemExit(result.exit_code)
     if ctx.output_format == "json":
@@ -206,6 +222,7 @@ def plan_cmd(ctx: AppContext, prune: bool) -> None:
             selection_extra(ctx.deployments, ctx.destinations)
             + f" puts={len(plan.puts)} deletes={len(plan.deletes)} prune={prune}"
         ),
+        run_id=ctx.run_id,
     )
     raise SystemExit(EXIT_OK)
 
@@ -229,6 +246,7 @@ def apply_cmd(ctx: AppContext, yes: bool, max_concurrency: int, prune: bool) -> 
         deployments=_dep_set(ctx),
         destinations=_dest_set(ctx),
         prune=prune,
+        run_id=ctx.run_id,
     )
     if ctx.output_format == "json":
         click.echo(render_apply_json(report))
@@ -242,6 +260,7 @@ def apply_cmd(ctx: AppContext, yes: bool, max_concurrency: int, prune: bool) -> 
             selection_extra(ctx.deployments, ctx.destinations)
             + f" applied={report.summary.applied} failed={report.summary.failed} prune={prune}"
         ),
+        run_id=ctx.run_id,
     )
     raise SystemExit(report.exit_code)
 
@@ -266,6 +285,7 @@ def health_cmd(ctx: AppContext) -> None:
         command="health",
         config_path=ctx.config_path if ctx.config_path.exists() else None,
         exit_code=report.exit_code,
+        run_id=ctx.run_id,
     )
     raise SystemExit(report.exit_code)
 
@@ -287,13 +307,19 @@ def ui_cmd(ctx: AppContext, prune: bool) -> None:
         raise SystemExit(EXIT_CONFIG)
     from secretsync.tui.app import SecretSyncApp
 
-    app = SecretSyncApp(services=ctx.services, config_path=ctx.config_path, prune=prune)
+    app = SecretSyncApp(
+        services=ctx.services,
+        config_path=ctx.config_path,
+        prune=prune,
+        run_id=ctx.run_id,
+    )
     report = app.run()
     code = report.exit_code if report is not None else EXIT_OK
     record_audit(
         command="ui",
         config_path=ctx.config_path if ctx.config_path.exists() else None,
         exit_code=code,
+        run_id=ctx.run_id,
     )
     raise SystemExit(code)
 
