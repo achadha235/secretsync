@@ -1,5 +1,5 @@
 [project]
-name = "secretsync"
+name = "secretsync-cli"
 version = "0.1.0"
 description = "Declarative secret delivery across deployment platforms"
 readme = "README.md"
