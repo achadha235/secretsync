@@ -61,18 +61,6 @@ jobs:
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
 
-      - name: Commit and tag
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if [ "${{ inputs.bump }}" != "none" ]; then
-            git add pyproject.toml uv.lock
-            git commit -m "release: ${{ steps.version.outputs.tag }}"
-            git push origin HEAD
-          fi
-          git tag -a "${{ steps.version.outputs.tag }}" -m "Release ${{ steps.version.outputs.tag }}"
-          git push origin "${{ steps.version.outputs.tag }}"
-
       - name: Build artifacts
         run: uv build
 
@@ -86,6 +74,19 @@ jobs:
         env:
           UV_PUBLISH_TOKEN: ${{ secrets.UV_PUBLISH_TOKEN }}
         run: uv publish
+
+      # Git mutations only after a successful PyPI upload.
+      - name: Commit and tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ "${{ inputs.bump }}" != "none" ]; then
+            git add pyproject.toml uv.lock
+            git commit -m "release: ${{ steps.version.outputs.tag }}"
+            git push origin HEAD
+          fi
+          git tag -a "${{ steps.version.outputs.tag }}" -m "Release ${{ steps.version.outputs.tag }}"
+          git push origin "${{ steps.version.outputs.tag }}"
 
       - name: GitHub Release
         env:
