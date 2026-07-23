@@ -1,0 +1,76 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release:
+    name: Build, checksum, publish
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Sync dependencies
+        run: uv sync --frozen --all-groups
+
+      - name: Quality gates
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+          uv run mypy src
+          uv run pytest --cov=secretsync --cov-fail-under=80 -q
+
+      - name: Build artifacts
+        run: uv build
+
+      - name: SHA256SUMS
+        working-directory: dist
+        run: |
+          sha256sum secretsync-*.whl secretsync-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/secretsync-*.whl
+            dist/secretsync-*.tar.gz
+
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          body: |
+            See [CHANGELOG.md](https://github.com/achadha235/secretsync/blob/main/CHANGELOG.md).
+
+            **MVP notes**
+            - Always-write: every planned put is written; plans never contain values.
+            - Vercel writes affect future deployments only (no redeploy).
+            - SST secret changes need a later `sst deploy` (unless `sst dev` is active).
+
+            Verify downloads with `SHA256SUMS`.
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/SHA256SUMS
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/

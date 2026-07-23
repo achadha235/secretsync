@@ -95,10 +95,22 @@ def resolve_executable(name: str) -> Path | None:
     return Path(found) if found else None
 
 
-def _stderr_summary(data: bytes | None) -> str:
+def _stderr_summary(data: bytes | None, secrets: list[str] | None = None) -> str:
     return sanitize_provider_message(
-        (data or b"")[:BOUNDED_STDERR].decode("utf-8", errors="replace")
+        (data or b"")[:BOUNDED_STDERR].decode("utf-8", errors="replace"),
+        secrets,
     )
+
+
+def _secrets_from_request(request: SecureProcessRequest) -> list[str]:
+    """Collect plaintext secret strings that might be echoed by a child on stderr."""
+    secrets: list[str] = []
+    if request.env_file is not None:
+        for value in request.env_file.variables.values():
+            secrets.append(bytes(value).decode("utf-8", errors="replace"))
+    if request.stdin_bytes is not None:
+        secrets.append(bytes(request.stdin_bytes).decode("utf-8", errors="replace"))
+    return secrets
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,7 +184,7 @@ class AsyncSecureProcessRunner:
         return ProcessResult(
             exit_code=int(proc.returncode or 0),
             duration_ms=0,
-            stderr_summary=_stderr_summary(stderr_b),
+            stderr_summary=_stderr_summary(stderr_b, _secrets_from_request(request)),
         )
 
     def _execute_with_env_file_sync(self, request: SecureProcessRequest) -> ProcessResult:
@@ -245,7 +257,7 @@ class AsyncSecureProcessRunner:
             return ProcessResult(
                 exit_code=int(proc.returncode or 0),
                 duration_ms=0,
-                stderr_summary=_stderr_summary(stderr_b),
+                stderr_summary=_stderr_summary(stderr_b, _secrets_from_request(request)),
             )
         finally:
             if saved_fd3 >= 0:
