@@ -59,7 +59,15 @@ def test_registry_with_fakes_create_and_list() -> None:
     assert by_id["vercel"]["status"] == "planned"
     assert by_id["sst"]["status"] == "planned"
     statuses = [m["status"] for m in manifests]
-    assert statuses == ["registered", "registered", "planned", "planned", "planned"]
+    assert statuses == [
+        "registered",
+        "registered",
+        "registered",
+        "planned",
+        "planned",
+        "planned",
+    ]
+    assert by_id["fake-prune"]["status"] == "registered"
 
 
 def test_registered_planned_id_skips_planned_list_entry() -> None:

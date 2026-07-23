@@ -193,3 +193,74 @@ async def test_conflict_edit_fallback() -> None:
     assert result.results[0].status == "applied"
     assert result.results[0].effect == "updated"
     assert result.requests_made >= 2
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_list_names_filters_by_targets() -> None:
+    respx.get("https://api.vercel.com/v9/projects/web/env").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "envs": [
+                    {"id": "1", "key": "KEEP", "target": ["production"]},
+                    {"id": "2", "key": "OTHER", "target": ["preview"]},
+                    {"id": "3", "key": "BOTH", "target": ["production", "preview"]},
+                ]
+            },
+        )
+    )
+    dest = VercelFactory().create(_services())
+    names = await dest.list_names(
+        {
+            "connector": "vercel",
+            "project": "web",
+            "auth": {"tokenEnv": "VERCEL_TOKEN"},
+        },
+        {"targets": ["production"], "sensitive": False},
+        OperationContext(correlation_id="c1"),
+    )
+    assert names == frozenset({"KEEP", "BOTH"})
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_delete_env_by_id() -> None:
+    from secretsync.destinations.base import DeleteMutation
+
+    respx.get("https://api.vercel.com/v9/projects/web/env").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "envs": [
+                    {"id": "env_orphan", "key": "ORPHAN", "target": ["production"]},
+                ]
+            },
+        )
+    )
+    delete = respx.delete("https://api.vercel.com/v9/projects/web/env/env_orphan").mock(
+        return_value=httpx.Response(204)
+    )
+    dest = VercelFactory().create(_services())
+    result = await dest.apply(
+        ApplyDestinationRequest(
+            deployment_id="dep",
+            destination_config={
+                "connector": "vercel",
+                "project": "web",
+                "auth": {"tokenEnv": "VERCEL_TOKEN"},
+            },
+            mutations=[],
+            deletes=[
+                DeleteMutation(
+                    mutation_id="dep:delete:ORPHAN",
+                    name="ORPHAN",
+                    scopes=({"targets": ["production"], "sensitive": False},),
+                )
+            ],
+        ),
+        OperationContext(correlation_id="c1"),
+    )
+    assert delete.called
+    assert result.results[0].status == "applied"
+    assert result.results[0].effect == "deleted"

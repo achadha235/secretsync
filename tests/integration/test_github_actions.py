@@ -177,3 +177,61 @@ def test_encrypt_roundtrip_shape() -> None:
     box = public.SealedBox(private)
     plain = box.decrypt(base64.b64decode(encrypted))
     assert plain == b"hello"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_list_names_repository() -> None:
+    respx.get("https://api.github.com/repos/acme/web/actions/secrets").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "total_count": 2,
+                "secrets": [{"name": "A"}, {"name": "B"}],
+            },
+        )
+    )
+    dest = GitHubActionsFactory().create(_services())
+    names = await dest.list_names(
+        {
+            "connector": "github-actions",
+            "repository": "acme/web",
+            "auth": {"tokenEnv": "GITHUB_TOKEN"},
+        },
+        {"kind": "repository"},
+        OperationContext(correlation_id="c1"),
+    )
+    assert names == frozenset({"A", "B"})
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_delete_repository_secret() -> None:
+    from secretsync.destinations.base import DeleteMutation
+
+    route = respx.delete("https://api.github.com/repos/acme/web/actions/secrets/ORPHAN").mock(
+        return_value=httpx.Response(204)
+    )
+    dest = GitHubActionsFactory().create(_services())
+    result = await dest.apply(
+        ApplyDestinationRequest(
+            deployment_id="dep",
+            destination_config={
+                "connector": "github-actions",
+                "repository": "acme/web",
+                "auth": {"tokenEnv": "GITHUB_TOKEN"},
+            },
+            mutations=[],
+            deletes=[
+                DeleteMutation(
+                    mutation_id="dep:delete:ORPHAN",
+                    name="ORPHAN",
+                    scopes=({"kind": "repository"},),
+                )
+            ],
+        ),
+        OperationContext(correlation_id="c1"),
+    )
+    assert route.called
+    assert result.results[0].status == "applied"
+    assert result.results[0].effect == "deleted"

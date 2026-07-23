@@ -11,9 +11,11 @@ from secretsync.destinations.base import (
     ApplyDestinationRequest,
     ApplyDestinationResult,
     BatchCapability,
+    DeleteMutation,
     DestinationCapabilities,
     DestinationManifest,
     Issue,
+    ListNamesError,
     MutationResult,
     OperationContext,
     PutMutation,
@@ -90,6 +92,35 @@ def _env_type(scope: Mapping[str, JsonValue]) -> str:
     return "encrypted"
 
 
+def _env_matches_scope(item: Mapping[str, Any], scope: Mapping[str, JsonValue]) -> bool:
+    """True when a remote env entry belongs to the deployment inventory unit."""
+    targets_raw = scope.get("targets")
+    if not isinstance(targets_raw, list):
+        return False
+    wanted = {str(t) for t in targets_raw}
+    remote_targets = item.get("target") or item.get("targets") or []
+    if not isinstance(remote_targets, list):
+        return False
+    remote = {str(t) for t in remote_targets}
+    if not wanted.intersection(remote):
+        return False
+    scope_branch = scope.get("gitBranch")
+    item_branch = item.get("gitBranch")
+    if scope_branch is None:
+        return item_branch is None
+    return item_branch == scope_branch
+
+
+def _parse_env_list(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if isinstance(payload, dict):
+        envs = payload.get("envs", [])
+        if isinstance(envs, list):
+            return [item for item in envs if isinstance(item, dict)]
+    return []
+
+
 @dataclass
 class VercelDestination:
     manifest: DestinationManifest
@@ -104,6 +135,57 @@ class VercelDestination:
             issues.append(Issue(code="AUTH_MISSING", message="vercel requires auth.tokenEnv"))
         return issues
 
+    async def list_names(
+        self,
+        config: Mapping[str, JsonValue],
+        scope: Mapping[str, JsonValue],
+        context: OperationContext,
+    ) -> frozenset[str]:
+        project = _project(config)
+        token_env = _token_env(config)
+        if project is None or token_env is None:
+            raise ListNamesError(
+                SafeConnectorError(
+                    code="DESTINATION_INVALID",
+                    message="Invalid vercel destination configuration",
+                    correlation_id=context.correlation_id,
+                )
+            )
+        reason = _validate_scope(dict(scope))
+        if reason:
+            raise ListNamesError(
+                SafeConnectorError(
+                    code="DESTINATION_INVALID",
+                    message=reason,
+                    correlation_id=context.correlation_id,
+                )
+            )
+        token = self.environ.get(token_env)
+        if not token:
+            raise ListNamesError(
+                SafeConnectorError(
+                    code="AUTH_MISSING",
+                    message=f"Connector credential environment variable '{token_env}' is absent",
+                    correlation_id=context.correlation_id,
+                )
+            )
+        team_id = _team_id(config)
+        headers = {"Authorization": f"Bearer {token}"}
+        client = self.http_client_factory.create(headers=headers)
+        try:
+            async with client:
+                envs, _ = await self._list_envs(
+                    client, project=project, team_id=team_id, correlation_id=context.correlation_id
+                )
+        except HttpRequestError as exc:
+            raise ListNamesError(exc.safe) from exc
+        except ListNamesError:
+            raise
+        names = {
+            str(item["key"]) for item in envs if "key" in item and _env_matches_scope(item, scope)
+        }
+        return frozenset(names)
+
     async def apply(
         self,
         request: ApplyDestinationRequest,
@@ -112,13 +194,14 @@ class VercelDestination:
         config = request.destination_config
         project = _project(config)
         token_env = _token_env(config)
+        all_ops: list[PutMutation | DeleteMutation] = [*request.mutations, *request.deletes]
         if project is None or token_env is None:
             error = SafeConnectorError(
                 code="DESTINATION_INVALID",
                 message="Invalid vercel destination configuration",
                 correlation_id=context.correlation_id,
             )
-            return _all_failed(request.mutations, error)
+            return _all_failed_ops(all_ops, error)
 
         token = self.environ.get(token_env)
         if not token:
@@ -127,7 +210,7 @@ class VercelDestination:
                 message=f"Connector credential environment variable '{token_env}' is absent",
                 correlation_id=context.correlation_id,
             )
-            return _all_failed(request.mutations, error)
+            return _all_failed_ops(all_ops, error)
 
         # Validate scopes up front.
         for mutation in request.mutations:
@@ -138,7 +221,7 @@ class VercelDestination:
                     mutation_id=mutation.mutation_id,
                     correlation_id=context.correlation_id,
                 )
-                return _all_failed(request.mutations, error)
+                return _all_failed_ops(all_ops, error)
             reason = _validate_scope(dict(mutation.scopes[0]))
             if reason:
                 error = SafeConnectorError(
@@ -147,7 +230,25 @@ class VercelDestination:
                     mutation_id=mutation.mutation_id,
                     correlation_id=context.correlation_id,
                 )
-                return _all_failed(request.mutations, error)
+                return _all_failed_ops(all_ops, error)
+        for deletion in request.deletes:
+            if not deletion.scopes:
+                error = SafeConnectorError(
+                    code="DESTINATION_INVALID",
+                    message="Missing Vercel scope on delete",
+                    mutation_id=deletion.mutation_id,
+                    correlation_id=context.correlation_id,
+                )
+                return _all_failed_ops(all_ops, error)
+            reason = _validate_scope(dict(deletion.scopes[0]))
+            if reason:
+                error = SafeConnectorError(
+                    code="DESTINATION_INVALID",
+                    message=reason,
+                    mutation_id=deletion.mutation_id,
+                    correlation_id=context.correlation_id,
+                )
+                return _all_failed_ops(all_ops, error)
 
         team_id = _team_id(config)
         headers = {"Authorization": f"Bearer {token}"}
@@ -157,8 +258,6 @@ class VercelDestination:
         results: dict[str, MutationResult] = {}
 
         async with client:
-            if not request.mutations:
-                return ApplyDestinationResult(results=(), requests_made=0)
             for chunk in _chunks(request.mutations, max_items):
                 if not chunk:
                     continue
@@ -172,7 +271,18 @@ class VercelDestination:
                 requests_made += n
                 results.update(chunk_results)
 
-        ordered = tuple(results[m.mutation_id] for m in request.mutations)
+            if request.deletes:
+                delete_results, n = await self._delete_many(
+                    client,
+                    project=project,
+                    team_id=team_id,
+                    deletes=request.deletes,
+                    correlation_id=context.correlation_id,
+                )
+                requests_made += n
+                results.update(delete_results)
+
+        ordered = tuple(results[op.mutation_id] for op in all_ops)
         return ApplyDestinationResult(results=ordered, requests_made=requests_made)
 
     async def _upsert_chunk(
@@ -275,6 +385,125 @@ class VercelDestination:
             1,
         )
 
+    async def _list_envs(
+        self,
+        client: Any,
+        *,
+        project: str,
+        team_id: str | None,
+        correlation_id: str,
+    ) -> tuple[list[dict[str, Any]], int]:
+        list_url = f"{VERCEL_API}/v9/projects/{quote(project, safe='')}/env"
+        params: dict[str, str] = {}
+        if team_id:
+            params["teamId"] = team_id
+        listed = await request_with_retries(
+            client, "GET", list_url, params=params, correlation_id=correlation_id
+        )
+        if listed.status_code != 200:
+            raise ListNamesError(
+                error_for_status(listed.status_code, correlation_id=correlation_id)
+            )
+        return _parse_env_list(listed.json()), 1
+
+    async def _delete_many(
+        self,
+        client: Any,
+        *,
+        project: str,
+        team_id: str | None,
+        deletes: Sequence[DeleteMutation],
+        correlation_id: str,
+    ) -> tuple[dict[str, MutationResult], int]:
+        try:
+            envs, list_requests = await self._list_envs(
+                client, project=project, team_id=team_id, correlation_id=correlation_id
+            )
+        except ListNamesError as exc:
+            return (
+                {
+                    d.mutation_id: MutationResult(
+                        mutation_id=d.mutation_id,
+                        status="failed",
+                        error=exc.safe,
+                    )
+                    for d in deletes
+                },
+                1,
+            )
+        except HttpRequestError as exc:
+            return (
+                {
+                    d.mutation_id: MutationResult(
+                        mutation_id=d.mutation_id,
+                        status="failed",
+                        error=exc.safe,
+                    )
+                    for d in deletes
+                },
+                1,
+            )
+
+        # name+scope → env id (first matching entry)
+        results: dict[str, MutationResult] = {}
+        requests = list_requests
+        for deletion in deletes:
+            scope = dict(deletion.scopes[0])
+            env_id: str | None = None
+            for item in envs:
+                if item.get("key") == deletion.name and _env_matches_scope(item, scope):
+                    env_id = str(item.get("id", "")) or None
+                    break
+            if env_id is None:
+                # Already absent — treat as successful delete for reconcile.
+                results[deletion.mutation_id] = MutationResult(
+                    mutation_id=deletion.mutation_id,
+                    status="applied",
+                    effect="deleted",
+                )
+                continue
+            delete_url = (
+                f"{VERCEL_API}/v9/projects/{quote(project, safe='')}/env/{quote(env_id, safe='')}"
+            )
+            params: dict[str, str] = {}
+            if team_id:
+                params["teamId"] = team_id
+            try:
+                response = await request_with_retries(
+                    client,
+                    "DELETE",
+                    delete_url,
+                    params=params,
+                    mutation_id=deletion.mutation_id,
+                    correlation_id=correlation_id,
+                )
+                requests += 1
+            except HttpRequestError as exc:
+                requests += 1
+                results[deletion.mutation_id] = MutationResult(
+                    mutation_id=deletion.mutation_id,
+                    status="failed",
+                    error=exc.safe,
+                )
+                continue
+            if response.status_code in {200, 204, 404}:
+                results[deletion.mutation_id] = MutationResult(
+                    mutation_id=deletion.mutation_id,
+                    status="applied",
+                    effect="deleted",
+                )
+            else:
+                results[deletion.mutation_id] = MutationResult(
+                    mutation_id=deletion.mutation_id,
+                    status="failed",
+                    error=error_for_status(
+                        response.status_code,
+                        mutation_id=deletion.mutation_id,
+                        correlation_id=correlation_id,
+                    ),
+                )
+        return results, requests
+
     async def _edit_fallback(
         self,
         client: Any,
@@ -285,13 +514,21 @@ class VercelDestination:
         correlation_id: str,
     ) -> tuple[dict[str, MutationResult], int]:
         """Retrieve env metadata and PATCH each conflicting key."""
-        list_url = f"{VERCEL_API}/v9/projects/{quote(project, safe='')}/env"
-        params: dict[str, str] = {}
-        if team_id:
-            params["teamId"] = team_id
         try:
-            listed = await request_with_retries(
-                client, "GET", list_url, params=params, correlation_id=correlation_id
+            envs, list_requests = await self._list_envs(
+                client, project=project, team_id=team_id, correlation_id=correlation_id
+            )
+        except ListNamesError as exc:
+            return (
+                {
+                    m.mutation_id: MutationResult(
+                        mutation_id=m.mutation_id,
+                        status="failed",
+                        error=exc.safe,
+                    )
+                    for m in mutations
+                },
+                1,
             )
         except HttpRequestError as exc:
             return (
@@ -306,29 +543,13 @@ class VercelDestination:
                 1,
             )
 
-        if listed.status_code != 200:
-            err = error_for_status(listed.status_code, correlation_id=correlation_id)
-            return (
-                {
-                    m.mutation_id: MutationResult(
-                        mutation_id=m.mutation_id,
-                        status="failed",
-                        error=err,
-                    )
-                    for m in mutations
-                },
-                1,
-            )
-
-        envs = listed.json().get("envs", listed.json() if isinstance(listed.json(), list) else [])
         by_key: dict[str, str] = {}
-        if isinstance(envs, list):
-            for item in envs:
-                if isinstance(item, dict) and "key" in item and "id" in item:
-                    by_key[str(item["key"])] = str(item["id"])
+        for item in envs:
+            if "key" in item and "id" in item:
+                by_key[str(item["key"])] = str(item["id"])
 
         results: dict[str, MutationResult] = {}
-        requests = 1  # list call
+        requests = list_requests
         for mutation in mutations:
             env_id = by_key.get(mutation.name)
             if env_id is None:
@@ -401,13 +622,12 @@ def _chunks(items: Sequence[PutMutation], size: int) -> list[Sequence[PutMutatio
     return [items[i : i + size] for i in range(0, len(items), size)]
 
 
-def _all_failed(
-    mutations: Sequence[PutMutation], error: SafeConnectorError
+def _all_failed_ops(
+    ops: Sequence[PutMutation | DeleteMutation], error: SafeConnectorError
 ) -> ApplyDestinationResult:
     return ApplyDestinationResult(
         results=tuple(
-            MutationResult(mutation_id=m.mutation_id, status="failed", error=error)
-            for m in mutations
+            MutationResult(mutation_id=op.mutation_id, status="failed", error=error) for op in ops
         ),
         requests_made=0,
     )

@@ -167,14 +167,20 @@ def validate_cmd(ctx: AppContext) -> None:
 
 
 @cli.command("plan")
+@click.option(
+    "--prune",
+    is_flag=True,
+    help="List remotes and plan deletes for secrets not in YAML (per destination scope).",
+)
 @click.pass_obj
-def plan_cmd(ctx: AppContext) -> None:
+def plan_cmd(ctx: AppContext, prune: bool) -> None:
     """Produce a value-free always-write plan."""
     plan, result = plan_from_path(
         ctx.services,
         ctx.config_path,
         deployments=_dep_set(ctx),
         destinations=_dest_set(ctx),
+        prune=prune,
     )
     if plan is None:
         if ctx.output_format == "json":
@@ -196,7 +202,10 @@ def plan_cmd(ctx: AppContext) -> None:
         command="plan",
         config_path=ctx.config_path,
         exit_code=EXIT_OK,
-        extra=selection_extra(ctx.deployments, ctx.destinations) + f" puts={len(plan.puts)}",
+        extra=(
+            selection_extra(ctx.deployments, ctx.destinations)
+            + f" puts={len(plan.puts)} deletes={len(plan.deletes)} prune={prune}"
+        ),
     )
     raise SystemExit(EXIT_OK)
 
@@ -204,8 +213,13 @@ def plan_cmd(ctx: AppContext) -> None:
 @cli.command("apply")
 @click.option("--yes", is_flag=True, help="Skip interactive confirmation.")
 @click.option("--max-concurrency", type=click.IntRange(1, 32), default=4, show_default=True)
+@click.option(
+    "--prune",
+    is_flag=True,
+    help="List remotes and delete secrets not in YAML (per destination scope).",
+)
 @click.pass_obj
-def apply_cmd(ctx: AppContext, yes: bool, max_concurrency: int) -> None:
+def apply_cmd(ctx: AppContext, yes: bool, max_concurrency: int, prune: bool) -> None:
     """Rebuild plan, resolve values, and apply destination mutations."""
     report = run_apply(
         ctx.services,
@@ -214,6 +228,7 @@ def apply_cmd(ctx: AppContext, yes: bool, max_concurrency: int) -> None:
         max_concurrency=max_concurrency,
         deployments=_dep_set(ctx),
         destinations=_dest_set(ctx),
+        prune=prune,
     )
     if ctx.output_format == "json":
         click.echo(render_apply_json(report))
@@ -225,7 +240,7 @@ def apply_cmd(ctx: AppContext, yes: bool, max_concurrency: int) -> None:
         exit_code=report.exit_code,
         extra=(
             selection_extra(ctx.deployments, ctx.destinations)
-            + f" applied={report.summary.applied} failed={report.summary.failed}"
+            + f" applied={report.summary.applied} failed={report.summary.failed} prune={prune}"
         ),
     )
     raise SystemExit(report.exit_code)
@@ -256,8 +271,13 @@ def health_cmd(ctx: AppContext) -> None:
 
 
 @cli.command("ui")
+@click.option(
+    "--prune",
+    is_flag=True,
+    help="Enable plan-time remote reconcile (delete orphans) in the TUI.",
+)
 @click.pass_obj
-def ui_cmd(ctx: AppContext) -> None:
+def ui_cmd(ctx: AppContext, prune: bool) -> None:
     """Open Textual review/apply interface."""
     if ctx.output_format == "json":
         click.echo(
@@ -267,7 +287,7 @@ def ui_cmd(ctx: AppContext) -> None:
         raise SystemExit(EXIT_CONFIG)
     from secretsync.tui.app import SecretSyncApp
 
-    app = SecretSyncApp(services=ctx.services, config_path=ctx.config_path)
+    app = SecretSyncApp(services=ctx.services, config_path=ctx.config_path, prune=prune)
     report = app.run()
     code = report.exit_code if report is not None else EXIT_OK
     record_audit(

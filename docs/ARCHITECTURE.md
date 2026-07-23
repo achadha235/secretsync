@@ -48,11 +48,22 @@ Both Click and Textual use the same [`AppServices`](../src/secretsync/applicatio
 3. **Confirm** — CLI prompt or TUI confirmation (always-write warning).
 4. **Apply** — resolve values late into `bytearray`, call connectors, scrub buffers, build `ApplyReport`.
 
-MVP does not detect drift. `changeDetection: keyed-fingerprint` fails with `UNIMPLEMENTED_CHANGE_DETECTION`.
+MVP does not detect value drift. `changeDetection: keyed-fingerprint` fails with `UNIMPLEMENTED_CHANGE_DETECTION`.
+
+### Optional prune (plan-time remote reconcile)
+
+With `--prune` on `plan` / `apply` (or the TUI prune checkbox):
+
+1. Group selected deployments into inventory units (destination + normalized scope).
+2. Call each connector’s `list_names` (names only).
+3. **Deletes** = `remote_names − intended_names` from YAML for that unit.
+4. Apply runs **puts first, then deletes** per destination.
+
+There is no local last-applied state file — every prune plan reflects the live remote inventory. Auth/list failures fail the plan; they are not skipped. Connectors without `list_names` + delete support refuse prune with a clear error.
 
 ## Connector boundary
 
-Connectors own batching and provider adaptation. The coordinator groups mutations by destination and deployment, then calls `apply` with `PutMutation` values. Each mutation must receive exactly one result (`applied` / `failed` / `skipped`).
+Connectors own batching and provider adaptation. The coordinator groups mutations by destination and deployment, then calls `apply` with `PutMutation` values and optional `DeleteMutation`s. Each mutation must receive exactly one result (`applied` / `failed` / `skipped`).
 
 Capabilities are declared in manifests and checked by contract tests.
 

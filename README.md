@@ -40,13 +40,15 @@ uvx secretsync --destination vercel plan
 |---|---|
 | `secretsync init` | Create `secretsync.yaml` + `.env.secretsync.tpl` |
 | `secretsync validate` | Check config + required env presence |
-| `secretsync plan` | Value-free always-write plan |
-| `secretsync apply` | Resolve and write secrets |
+| `secretsync plan` | Value-free always-write plan (`--prune` lists remotes and plans deletes) |
+| `secretsync apply` | Resolve and write secrets (`--prune` also deletes orphans) |
 | `secretsync health` | Auth/reachability checks (skips unset tokens) |
 | `secretsync ui` | Interactive Textual review/apply |
 | `secretsync connectors` | List built-in connectors |
 
-Useful flags: `--config`, `--format json`, `--verbose`, `--quiet`, `--deployment`, `--destination`.
+Useful flags: `--config`, `--format json`, `--verbose`, `--quiet`, `--deployment`, `--destination`, `--prune`.
+
+With `--prune`, SecretSync lists remote secret **names** at plan time and treats YAML as the full desired inventory for each destination scope — remote secrets not listed in the config are planned for deletion (including secrets never created by SecretSync). Without `--prune`, apply is put-only.
 
 Runs write a value-free trail under `.secretsync/audit.log` (gitignored).
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Literal, Protocol
 
@@ -63,17 +63,25 @@ class PutMutation:
 
 
 @dataclass(slots=True)
+class DeleteMutation:
+    mutation_id: str
+    name: str
+    scopes: tuple[Mapping[str, JsonValue], ...]
+
+
+@dataclass(slots=True)
 class ApplyDestinationRequest:
     deployment_id: str
     destination_config: Mapping[str, JsonValue]
     mutations: list[PutMutation]
+    deletes: list[DeleteMutation] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
 class MutationResult:
     mutation_id: str
     status: Literal["applied", "failed", "skipped"]
-    effect: Literal["upserted", "created", "updated", "unknown"] | None = None
+    effect: Literal["upserted", "created", "updated", "deleted", "unknown"] | None = None
     error: SafeConnectorError | None = None
 
 
@@ -85,15 +93,30 @@ class ApplyDestinationResult:
 
 @dataclass(frozen=True, slots=True)
 class OperationContext:
-    """Value-free context passed into connector apply calls."""
+    """Value-free context passed into connector apply / list calls."""
 
     correlation_id: str
+
+
+class ListNamesError(Exception):
+    """Raised when a connector cannot list remote secret names."""
+
+    def __init__(self, safe: SafeConnectorError) -> None:
+        self.safe = safe
+        super().__init__(safe.message)
 
 
 class Destination(Protocol):
     manifest: DestinationManifest
 
     async def validate(self, config: Mapping[str, JsonValue]) -> list[Issue]: ...
+
+    async def list_names(
+        self,
+        config: Mapping[str, JsonValue],
+        scope: Mapping[str, JsonValue],
+        context: OperationContext,
+    ) -> frozenset[str]: ...
 
     async def apply(
         self,

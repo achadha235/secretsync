@@ -23,10 +23,16 @@ from secretsync.infrastructure.process import (
 class RecordingRunner:
     calls: list[SecureProcessRequest] = field(default_factory=list)
     exit_code: int = 0
+    stdout_bytes: bytes = b""
 
     async def execute(self, request: SecureProcessRequest) -> ProcessResult:
         self.calls.append(request)
-        return ProcessResult(exit_code=self.exit_code, duration_ms=1, stderr_summary="")
+        return ProcessResult(
+            exit_code=self.exit_code,
+            duration_ms=1,
+            stderr_summary="",
+            stdout_bytes=self.stdout_bytes if request.capture_stdout else b"",
+        )
 
 
 def _dest(tmp_path: Path, runner: Any, *, probe_ok: bool = True) -> SstDestination:
@@ -154,3 +160,52 @@ async def test_validate_requires_working_directory() -> None:
     )
     issues = await dest.validate({"connector": "sst", "executable": "sst"})
     assert any("workingDirectory" in i.message for i in issues)
+
+
+@pytest.mark.asyncio
+async def test_list_names_parses_dotenv_stdout(tmp_path: Path) -> None:
+    runner = RecordingRunner(stdout_bytes=b'Keep="x"\nOrphan="y"\n')
+    dest = _dest(tmp_path, runner)
+    names = await dest.list_names(
+        {
+            "connector": "sst",
+            "workingDirectory": str(tmp_path),
+            "executable": "sst",
+        },
+        {"stage": "production", "fallback": False},
+        OperationContext(correlation_id="c1"),
+    )
+    assert names == frozenset({"Keep", "Orphan"})
+    assert "secret" in runner.calls[0].arguments and "list" in runner.calls[0].arguments
+    assert runner.calls[0].capture_stdout is True
+
+
+@pytest.mark.asyncio
+async def test_delete_calls_secret_remove(tmp_path: Path) -> None:
+    from secretsync.destinations.base import DeleteMutation
+
+    runner = RecordingRunner()
+    dest = _dest(tmp_path, runner, probe_ok=False)
+    result = await dest.apply(
+        ApplyDestinationRequest(
+            deployment_id="dep",
+            destination_config={
+                "connector": "sst",
+                "workingDirectory": str(tmp_path),
+                "executable": "sst",
+            },
+            mutations=[],
+            deletes=[
+                DeleteMutation(
+                    mutation_id="dep:delete:Orphan",
+                    name="Orphan",
+                    scopes=({"stage": "production", "fallback": False},),
+                )
+            ],
+        ),
+        OperationContext(correlation_id="c1"),
+    )
+    assert result.results[0].status == "applied"
+    assert result.results[0].effect == "deleted"
+    assert "remove" in runner.calls[0].arguments
+    assert "Orphan" in runner.calls[0].arguments

@@ -12,6 +12,7 @@ JsonValue = None | bool | int | float | str | list["JsonValue"] | dict[str, "Jso
 
 class Operation(StrEnum):
     PUT = "put"
+    DELETE = "delete"
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +38,13 @@ class PlannedPut:
     target: TargetRef
 
 
+@dataclass(frozen=True, slots=True)
+class PlannedDelete:
+    mutation_id: str
+    deployment_id: str
+    target: TargetRef
+
+
 @dataclass(slots=True)
 class ResolvedPut:
     """Apply-only; must never reach presentation adapters."""
@@ -49,6 +57,7 @@ class ResolvedPut:
 class Plan:
     strategy: str
     puts: tuple[PlannedPut, ...]
+    deletes: tuple[PlannedDelete, ...] = ()
 
 
 @dataclass(slots=True)
