@@ -1,4 +1,4 @@
-"""SST secrets destination via secure env-file pipe or stdin set."""
+"""SST secrets destination via named-pipe env-file load or stdin set."""
 
 from __future__ import annotations
 
@@ -26,18 +26,17 @@ from secretsync.destinations.base import (
 )
 from secretsync.domain.models import JsonValue
 from secretsync.infrastructure.process import (
-    ENV_FILE_FD,
+    ENV_FILE_PLACEHOLDER,
     AsyncSecureProcessRunner,
     EnvFileInput,
     ProcessRunnerError,
     SecureProcessRequest,
     build_minimal_child_env,
-    preferred_fd_path,
-    probe_env_file_descriptor,
+    probe_env_file_pipe,
     resolve_executable,
 )
 
-# Local non-secret reader used only for descriptor capability probes.
+# Local non-secret reader used only for named-pipe capability probes.
 _INLINE_READER = "import sys; p=sys.argv[1]; d=open(p,'rb').read(); sys.exit(0 if len(d)>0 else 1)"
 
 
@@ -50,7 +49,7 @@ def _capabilities() -> DestinationCapabilities:
             supported=True,
             max_items=None,
             atomic=False,
-            transport="env-file-pipe",
+            transport="named-pipe",
         ),
         delete_batch=BatchCapability(supported=True, max_items=1),
         multiple_scopes_per_mutation=False,
@@ -332,8 +331,8 @@ class SstDestination:
                 )
             )
 
-        # OS-level pipe probe (python reader). Independent of bunx/sst.
-        os_probe = await probe_env_file_descriptor(
+        # Named-pipe probe (python reader). Independent of bunx/sst.
+        os_probe = await probe_env_file_pipe(
             self.process_runner,
             reader_executable=Path(sys.executable),
             reader_args=("-c", _INLINE_READER),
@@ -342,7 +341,7 @@ class SstDestination:
         )
 
         if name == "bunx":
-            # Prefer direct `sst` when available so fd 3 is not lost through bunx.
+            # Prefer direct `sst` when available; bunx works with named pipes either way.
             sst = resolve_executable("sst")
             if sst is not None:
                 self._resolved_executable = sst
@@ -351,8 +350,7 @@ class SstDestination:
                 return
             self._resolved_executable = exe
             self._argv_prefix = ("sst",)
-            # Without a direct sst binary, avoid bulk pipe through bunx.
-            self._probe_ok = False
+            self._probe_ok = os_probe
             return
 
         self._resolved_executable = exe
@@ -370,8 +368,14 @@ class SstDestination:
         correlation_id: str,
     ) -> tuple[dict[str, MutationResult], int]:
         assert self._resolved_executable is not None
-        fd_path = preferred_fd_path(ENV_FILE_FD)
-        args = [*self._argv_prefix, "secret", "load", fd_path, "--stage", stage]
+        args = [
+            *self._argv_prefix,
+            "secret",
+            "load",
+            ENV_FILE_PLACEHOLDER,
+            "--stage",
+            stage,
+        ]
         if fallback:
             args.append("--fallback")
         variables = {m.name: bytes(m.value) for m in mutations}
@@ -562,7 +566,7 @@ class SstFactory:
     manifest: DestinationManifest = field(
         default_factory=lambda: DestinationManifest(
             id="sst",
-            version="0.1.0+env-file-pipe",
+            version="0.1.0+named-pipe",
             capabilities=_capabilities(),
         )
     )

@@ -1,4 +1,4 @@
-"""Secure process runner with inherited anonymous env-file descriptor."""
+"""Secure process runner with named-pipe env-file delivery."""
 
 from __future__ import annotations
 
@@ -6,7 +6,8 @@ import contextlib
 import os
 import shutil
 import subprocess
-import sys
+import tempfile
+import threading
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -21,7 +22,7 @@ from secretsync.infrastructure.redaction import sanitize_provider_message
 # Alias kept local so infrastructure does not import destinations (circular).
 SafeConnectorError = SafeError
 
-ENV_FILE_FD = 3
+ENV_FILE_PLACEHOLDER = "{env_file}"
 BOUNDED_STDERR = 4096
 
 _BASE_ENV_KEYS = frozenset(
@@ -45,7 +46,6 @@ _BASE_ENV_KEYS = frozenset(
 @dataclass(frozen=True, slots=True)
 class EnvFileInput:
     variables: Mapping[str, bytes | bytearray]
-    file_descriptor: int = ENV_FILE_FD
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,12 +74,8 @@ class ProcessRunnerError(Exception):
         super().__init__(safe.message)
 
 
-def preferred_fd_path(fd: int = ENV_FILE_FD) -> str:
-    """Platform preferred path for an inherited descriptor."""
-    proc = f"/proc/self/fd/{fd}"
-    if sys.platform.startswith("linux") and os.path.exists(proc):
-        return proc
-    return f"/dev/fd/{fd}"
+def named_pipes_supported() -> bool:
+    return hasattr(os, "mkfifo")
 
 
 def build_minimal_child_env(parent: Mapping[str, str]) -> dict[str, str]:
@@ -115,9 +111,47 @@ def _secrets_from_request(request: SecureProcessRequest) -> list[str]:
     return secrets
 
 
+def _substitute_env_file_path(arguments: tuple[str, ...], pipe_path: str) -> tuple[str, ...]:
+    return tuple(
+        word.replace(ENV_FILE_PLACEHOLDER, pipe_path) if ENV_FILE_PLACEHOLDER in word else word
+        for word in arguments
+    )
+
+
+def _unblock_fifo(pipe_path: str) -> None:
+    """Open the FIFO for reading so a blocked writer can proceed or get EPIPE."""
+    try:
+        rd = os.open(pipe_path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
+        return
+    with contextlib.suppress(OSError):
+        os.close(rd)
+
+
+def _write_dotenv_to_fifo(
+    pipe_path: str,
+    variables: Mapping[str, bytes | bytearray],
+    errors: list[BaseException],
+) -> None:
+    """Write dotenv lines to the named pipe. Blocks until a reader opens."""
+    try:
+        with open(pipe_path, "wb") as pipe:
+
+            def _write(chunk: bytes) -> None:
+                pipe.write(chunk)
+
+            stream_dotenv(variables, _write)
+    except BrokenPipeError as exc:
+        errors.append(exc)
+    except DotenvEncodeError as exc:
+        errors.append(exc)
+    except OSError as exc:
+        errors.append(exc)
+
+
 @dataclass(frozen=True, slots=True)
 class AsyncSecureProcessRunner:
-    """Spawn children with optional inherited env-file descriptor (fd 3)."""
+    """Spawn children with optional named-pipe env-file delivery."""
 
     async def execute(self, request: SecureProcessRequest) -> ProcessResult:
         started = time.monotonic()
@@ -195,93 +229,88 @@ class AsyncSecureProcessRunner:
 
     def _execute_with_env_file_sync(self, request: SecureProcessRequest) -> ProcessResult:
         assert request.env_file is not None
-        if request.env_file.file_descriptor != ENV_FILE_FD:
+        if not named_pipes_supported():
             raise ProcessRunnerError(
                 SafeConnectorError(
                     code="PROCESS_DESCRIPTOR_UNSUPPORTED",
-                    message=(f"Only descriptor {ENV_FILE_FD} is supported for env-file pipes"),
+                    message="Named pipes (mkfifo) are not supported on this platform",
                 )
             )
 
-        # Map the pipe read end onto fd 3 in the *parent* before spawn.
-        # preexec_fn + close_fds cannot keep fd 3: close_fds runs after
-        # preexec and closes descriptors not listed in pass_fds.
-        read_fd, write_fd = os.pipe()
-        saved_fd3 = -1
-        proc: subprocess.Popen[bytes] | None = None
-        try:
-            with contextlib.suppress(OSError):
-                saved_fd3 = os.dup(ENV_FILE_FD)
-            os.dup2(read_fd, ENV_FILE_FD)
-            if read_fd != ENV_FILE_FD:
-                os.close(read_fd)
-            read_fd = -1
+        # ponytail: TemporaryDirectory + mkfifo — payload never hits disk; inode only
+        with tempfile.TemporaryDirectory(prefix="secretsync-env-") as temp_dir:
+            os.chmod(temp_dir, 0o700)
+            pipe_path = os.path.join(temp_dir, ".env")
+            os.mkfifo(pipe_path, 0o600)
 
-            proc = subprocess.Popen(  # noqa: S603
-                [str(request.executable), *request.arguments],
-                cwd=str(request.cwd),
-                env=dict(request.environment),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                stdin=subprocess.DEVNULL,
-                pass_fds=(ENV_FILE_FD,),
-                close_fds=True,
+            argv = _substitute_env_file_path(request.arguments, pipe_path)
+            writer_errors: list[BaseException] = []
+            writer = threading.Thread(
+                target=_write_dotenv_to_fifo,
+                args=(pipe_path, request.env_file.variables, writer_errors),
+                daemon=True,
             )
+            writer.start()
 
-            # Child has its own copy of fd 3; restore the parent's table.
-            if saved_fd3 >= 0:
-                os.dup2(saved_fd3, ENV_FILE_FD)
-                os.close(saved_fd3)
-                saved_fd3 = -1
-            else:
-                with contextlib.suppress(OSError):
-                    os.close(ENV_FILE_FD)
-
+            proc: subprocess.Popen[bytes] | None = None
             try:
+                proc = subprocess.Popen(  # noqa: S603
+                    [str(request.executable), *argv],
+                    cwd=str(request.cwd),
+                    env=dict(request.environment),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    stdin=subprocess.DEVNULL,
+                    close_fds=True,
+                )
+                try:
+                    _, stderr_b = proc.communicate(timeout=request.timeout_seconds)
+                except subprocess.TimeoutExpired as exc:
+                    proc.kill()
+                    proc.wait()
+                    _unblock_fifo(pipe_path)
+                    writer.join(timeout=2.0)
+                    raise TimeoutError("process timed out") from exc
 
-                def _write(chunk: bytes) -> None:
-                    os.write(write_fd, chunk)
+                writer.join(timeout=request.timeout_seconds)
+                if writer.is_alive():
+                    _unblock_fifo(pipe_path)
+                    writer.join(timeout=2.0)
 
-                stream_dotenv(request.env_file.variables, _write)
-            except BrokenPipeError as exc:
-                raise OSError(getattr(os, "EPIPE", 32), "EPIPE") from exc
-            except DotenvEncodeError as exc:
-                raise ProcessRunnerError(
-                    SafeConnectorError(code="DESTINATION_INVALID", message=str(exc))
-                ) from exc
+                if writer_errors:
+                    err = writer_errors[0]
+                    if isinstance(err, DotenvEncodeError):
+                        raise ProcessRunnerError(
+                            SafeConnectorError(code="DESTINATION_INVALID", message=str(err))
+                        ) from err
+                    if isinstance(err, BrokenPipeError) or (
+                        isinstance(err, OSError) and getattr(err, "errno", None) == getattr(os, "EPIPE", 32)
+                    ):
+                        raise OSError(getattr(os, "EPIPE", 32), "EPIPE") from err
+                    if isinstance(err, OSError):
+                        raise err
+                    raise ProcessRunnerError(
+                        SafeConnectorError(
+                            code="PROCESS_FAILED",
+                            message=f"Env-file pipe writer failed: {type(err).__name__}",
+                        )
+                    ) from err
+
+                return ProcessResult(
+                    exit_code=int(proc.returncode or 0),
+                    duration_ms=0,
+                    stderr_summary=_stderr_summary(stderr_b, _secrets_from_request(request)),
+                )
             finally:
-                with contextlib.suppress(OSError):
-                    os.close(write_fd)
-                write_fd = -1
-
-            try:
-                _, stderr_b = proc.communicate(timeout=request.timeout_seconds)
-            except subprocess.TimeoutExpired as exc:
-                proc.kill()
-                proc.wait()
-                raise TimeoutError("process timed out") from exc
-            return ProcessResult(
-                exit_code=int(proc.returncode or 0),
-                duration_ms=0,
-                stderr_summary=_stderr_summary(stderr_b, _secrets_from_request(request)),
-            )
-        finally:
-            if saved_fd3 >= 0:
-                with contextlib.suppress(OSError):
-                    os.dup2(saved_fd3, ENV_FILE_FD)
-                    os.close(saved_fd3)
-            if read_fd >= 0:
-                with contextlib.suppress(OSError):
-                    os.close(read_fd)
-            if write_fd >= 0:
-                with contextlib.suppress(OSError):
-                    os.close(write_fd)
-            if proc is not None and proc.poll() is None:
-                proc.kill()
-                proc.wait()
+                if writer.is_alive():
+                    _unblock_fifo(pipe_path)
+                    writer.join(timeout=2.0)
+                if proc is not None and proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
 
 
-async def probe_env_file_descriptor(
+async def probe_env_file_pipe(
     runner: AsyncSecureProcessRunner,
     *,
     reader_executable: Path,
@@ -289,12 +318,13 @@ async def probe_env_file_descriptor(
     cwd: Path | None = None,
     environment: Mapping[str, str] | None = None,
 ) -> bool:
-    """Non-secret probe: stream a known token through fd 3 to a local reader."""
+    """Non-secret probe: stream a known token through a named pipe to a local reader."""
+    if not named_pipes_supported():
+        return False
     env = dict(environment or build_minimal_child_env(os.environ))
-    fd_path = preferred_fd_path(ENV_FILE_FD)
     request = SecureProcessRequest(
         executable=reader_executable,
-        arguments=(*reader_args, fd_path),
+        arguments=(*reader_args, ENV_FILE_PLACEHOLDER),
         cwd=cwd or Path.cwd(),
         environment=env,
         env_file=EnvFileInput(variables={"PROBE": b"probe-token"}),

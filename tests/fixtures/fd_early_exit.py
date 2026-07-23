@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
-"""Exit immediately without reading fd 3 (forces EPIPE on writer)."""
+"""Exit immediately without reading the env-file path (writer unblocked via cleanup)."""
 
 from __future__ import annotations
 
-import sys
-
 
 def main() -> int:
-    print("early-exit", file=sys.stderr)
     return 0
 
 

@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
-"""Close inherited fd 3 immediately so the parent writer hits EPIPE."""
+"""Open the env-file path then close early so the parent writer hits EPIPE."""
 
 from __future__ import annotations
 
-import os
+import sys
 import time
 
 
-def main() -> int:
-    with __import__("contextlib").suppress(OSError):
-        os.close(3)
-    time.sleep(0.2)
+def main(argv: list[str]) -> int:
+    if len(argv) < 2:
+        return 2
+    path = argv[1]
+    # Open briefly so the writer unblocks, then close without draining — fat writes EPIPE.
+    with open(path, "rb") as handle:
+        handle.read(1)
+    time.sleep(0.5)
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv))
