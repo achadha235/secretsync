@@ -15,28 +15,82 @@ Full secrets platforms (Infisical and similar) can do this and more, but they ar
 ## Quickstart
 
 ```bash
+## Install with uv
+uv tool install secretsync-cli
+
 # Scaffold config + 1Password-style env template
-uvx secretsync init
-
-# Edit secretsync.yaml (repo/project/stage names) and .env.tpl (secret references), then inject env:
-# Example with 1Password CLI
-op run --env-file=.env.tpl -- uvx secretsync validate
-op run --env-file=.env.tpl -- uvx secretsync plan
-op run --env-file=.env.tpl -- uvx secretsync apply --yes
-
-# Run a health check to ensure secretsync is authenticated
-op run --env-file=.env.tpl -- uvx secretsync health
-
-## Plan and apply changes into your destination
-op run --env-file=.env.tpl -- uvx secretsync apply --yes
+secretsync init
 ```
 
-You can also target a single deployent or destination
+### Setup
 
 ```bash
-op run --env-file=.env.tpl -- uvx secretsync --deployment github-staging plan
-op run --env-file=.env.tpl -- uvx secretsync --deployment github-staging apply --yes
-op run --env-file=.env.tpl -- uvx secretsync --destination vercel plan
+# .env.tpl — vault refs injected into the process env (e.g. via `op run`)
+GITHUB_TOKEN="op://vault/github/token"   # connector auth
+API_KEY="op://vault/app/api-key"         # secret value SecretSync reads
+```
+
+```yaml
+# secretsync.yaml
+version: 1
+changeDetection: always-write
+
+# Logical secret ids → which process env var holds the plaintext value
+secrets:
+  apiKey:
+    env: API_KEY # reads os.environ["API_KEY"]
+
+# Named bundles of secrets to ship together
+sets:
+  production:
+    include: [apiKey]
+
+# Where secrets can be written (connector + auth)
+destinations:
+  github:
+    connector: github-actions
+    repository: owner/repo
+    auth:
+      tokenEnv: GITHUB_TOKEN # reads os.environ["GITHUB_TOKEN"] for API auth
+
+# Concrete pushes: which set → which destination, under what remote names
+deployments:
+  - name: github-production
+    set: production
+    destination: github
+    scope:
+      kind: environment
+      environment: production
+    secrets:
+      # logical id → remote secret name in GitHub Actions
+      apiKey: API_KEY
+```
+
+## Deploy secrets
+
+```bash
+# After editing secretsync.yaml (repo/project/stage names) and .env.tpl (secret references),
+# then inject env and run command:
+
+# Example with 1Password CLI:
+
+# Run a health check to ensure secretsync is authenticated
+op run --env-file=.env.tpl -- secretsync health
+
+# Validate and plan a config
+op run --env-file=.env.tpl -- secretsync validate ## makes sure the config is valid
+op run --env-file=.env.tpl -- secretsync plan ## shows you what changes will be made
+
+## Apply changes into your destination
+op run --env-file=.env.tpl -- secretsync apply ## applies the changes
+```
+
+You can also target a single deployment or destination
+
+```bash
+op run --env-file=.env.tpl -- secretsync --deployment github-production plan
+op run --env-file=.env.tpl -- secretsync --deployment github-production apply --yes
+op run --env-file=.env.tpl -- secretsync --destination github plan
 ```
 
 `--deployment` and `--destination` are repeatable; when both are set, only the intersection runs.
