@@ -43,6 +43,15 @@ secretsync = "secretsync.cli:cli"
 requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
+[tool.hatch.build.targets.wheel]
+packages = ["src/secretsync"]
+
+# Keep the sdist minimal: only package sources (README/LICENSE/pyproject.toml are
+# always included by hatchling). Do not ship examples, docs, tests, agent skills,
+# local config, or lockfiles.
+[tool.hatch.build.targets.sdist]
+only-include = ["src/secretsync"]
+
 [dependency-groups]
 dev = [
   "pytest>=8.4,<9",
