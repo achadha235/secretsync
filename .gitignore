@@ -24,3 +24,4 @@ htmlcov/
 .testagent/
 secretsync-apply-report.json
 .secretsync/
+.vercel
