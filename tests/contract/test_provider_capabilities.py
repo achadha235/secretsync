@@ -9,6 +9,8 @@ def test_github_capabilities_individual() -> None:
     assert manifest.id == "github-actions"
     assert manifest.capabilities.put_batch.supported is False
     assert manifest.capabilities.read_values is False
+    assert manifest.capabilities.list_names is True
+    assert manifest.capabilities.delete_batch.supported is True
 
 
 def test_vercel_capabilities_batch() -> None:
@@ -17,6 +19,8 @@ def test_vercel_capabilities_batch() -> None:
     assert manifest.capabilities.put_batch.supported is True
     assert manifest.capabilities.put_batch.max_items == 100
     assert manifest.capabilities.multiple_scopes_per_mutation is True
+    assert manifest.capabilities.list_names is True
+    assert manifest.capabilities.delete_batch.supported is True
 
 
 def test_sst_capabilities_env_file_pipe() -> None:
@@ -27,3 +31,5 @@ def test_sst_capabilities_env_file_pipe() -> None:
     assert manifest.capabilities.put_batch.supported is True
     assert manifest.capabilities.put_batch.transport == "env-file-pipe"
     assert manifest.capabilities.multiple_scopes_per_mutation is False
+    assert manifest.capabilities.list_names is True
+    assert manifest.capabilities.delete_batch.supported is True

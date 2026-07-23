@@ -13,9 +13,11 @@ from secretsync.destinations.base import (
     ApplyDestinationRequest,
     ApplyDestinationResult,
     BatchCapability,
+    DeleteMutation,
     DestinationCapabilities,
     DestinationManifest,
     Issue,
+    ListNamesError,
     MutationResult,
     OperationContext,
     PutMutation,
@@ -50,7 +52,7 @@ def _capabilities() -> DestinationCapabilities:
             atomic=False,
             transport="env-file-pipe",
         ),
-        delete_batch=BatchCapability(supported=False),
+        delete_batch=BatchCapability(supported=True, max_items=1),
         multiple_scopes_per_mutation=False,
         batch_across_scopes=False,
     )
@@ -75,6 +77,27 @@ def _parse_scope(scope: Mapping[str, JsonValue]) -> tuple[str, bool] | None:
     return stage.strip(), bool(scope.get("fallback", False))
 
 
+def parse_sst_secret_list_names(stdout: bytes) -> frozenset[str]:
+    """Extract secret names from `sst secret list` stdout; discard values immediately."""
+    names: set[str] = set()
+    for raw_line in stdout.splitlines():
+        line = raw_line.decode("utf-8", errors="replace").strip()
+        if not line or line.startswith("#"):
+            continue
+        lower = line.lower()
+        if lower in {"name", "names", "secret", "secrets"} or set(line) <= {"-", "─", "|", " "}:
+            continue
+        if "=" in line:
+            key = line.split("=", 1)[0].strip()
+            if key:
+                names.add(key)
+            continue
+        parts = line.split()
+        if parts:
+            names.add(parts[0])
+    return frozenset(names)
+
+
 @dataclass
 class SstDestination:
     manifest: DestinationManifest
@@ -96,6 +119,74 @@ class SstDestination:
             )
         return issues
 
+    async def list_names(
+        self,
+        config: Mapping[str, JsonValue],
+        scope: Mapping[str, JsonValue],
+        context: OperationContext,
+    ) -> frozenset[str]:
+        wd = _working_directory(config)
+        if wd is None:
+            raise ListNamesError(
+                SafeConnectorError(
+                    code="DESTINATION_INVALID",
+                    message="Invalid sst destination configuration",
+                    correlation_id=context.correlation_id,
+                )
+            )
+        parsed = _parse_scope(dict(scope))
+        if parsed is None:
+            raise ListNamesError(
+                SafeConnectorError(
+                    code="DESTINATION_INVALID",
+                    message="SST scope.stage is required",
+                    correlation_id=context.correlation_id,
+                )
+            )
+        stage, fallback = parsed
+        cwd = Path(wd).expanduser()
+        if not cwd.is_absolute():
+            cwd = (Path.cwd() / cwd).resolve()
+        if not cwd.is_dir():
+            raise ListNamesError(
+                SafeConnectorError(
+                    code="DESTINATION_INVALID",
+                    message=f"workingDirectory does not exist: {cwd}",
+                    correlation_id=context.correlation_id,
+                )
+            )
+        try:
+            await self._ensure_command(config, cwd)
+        except ProcessRunnerError as exc:
+            raise ListNamesError(exc.safe) from exc
+        assert self._resolved_executable is not None
+        args = [*self._argv_prefix, "secret", "list", "--stage", stage]
+        if fallback:
+            args.append("--fallback")
+        req = SecureProcessRequest(
+            executable=self._resolved_executable,
+            arguments=tuple(args),
+            cwd=cwd,
+            environment=build_minimal_child_env(self.environ),
+            capture_stdout=True,
+        )
+        try:
+            result = await self.process_runner.execute(req)
+        except ProcessRunnerError as exc:
+            raise ListNamesError(exc.safe) from exc
+        if result.exit_code != 0:
+            raise ListNamesError(
+                SafeConnectorError(
+                    code="PROCESS_FAILED",
+                    message="SST secret list failed",
+                    correlation_id=context.correlation_id,
+                    hint=result.stderr_summary or None,
+                )
+            )
+        names = parse_sst_secret_list_names(result.stdout_bytes)
+        del result
+        return names
+
     async def apply(
         self,
         request: ApplyDestinationRequest,
@@ -103,9 +194,12 @@ class SstDestination:
     ) -> ApplyDestinationResult:
         config = request.destination_config
         wd = _working_directory(config)
+        all_ids = [m.mutation_id for m in request.mutations] + [
+            d.mutation_id for d in request.deletes
+        ]
         if wd is None:
-            return _all_failed(
-                request.mutations,
+            return _all_failed_ids(
+                all_ids,
                 SafeConnectorError(
                     code="DESTINATION_INVALID",
                     message="Invalid sst destination configuration",
@@ -117,8 +211,8 @@ class SstDestination:
         if not cwd.is_absolute():
             cwd = (Path.cwd() / cwd).resolve()
         if not cwd.is_dir():
-            return _all_failed(
-                request.mutations,
+            return _all_failed_ids(
+                all_ids,
                 SafeConnectorError(
                     code="DESTINATION_INVALID",
                     message=f"workingDirectory does not exist: {cwd}",
@@ -129,8 +223,8 @@ class SstDestination:
         partitions: dict[tuple[str, bool], list[PutMutation]] = defaultdict(list)
         for mutation in request.mutations:
             if not mutation.scopes:
-                return _all_failed(
-                    request.mutations,
+                return _all_failed_ids(
+                    all_ids,
                     SafeConnectorError(
                         code="DESTINATION_INVALID",
                         message="Missing SST scope on mutation",
@@ -140,8 +234,8 @@ class SstDestination:
                 )
             parsed = _parse_scope(dict(mutation.scopes[0]))
             if parsed is None:
-                return _all_failed(
-                    request.mutations,
+                return _all_failed_ids(
+                    all_ids,
                     SafeConnectorError(
                         code="DESTINATION_INVALID",
                         message="SST scope.stage is required",
@@ -151,10 +245,35 @@ class SstDestination:
                 )
             partitions[parsed].append(mutation)
 
+        delete_partitions: dict[tuple[str, bool], list[DeleteMutation]] = defaultdict(list)
+        for deletion in request.deletes:
+            if not deletion.scopes:
+                return _all_failed_ids(
+                    all_ids,
+                    SafeConnectorError(
+                        code="DESTINATION_INVALID",
+                        message="Missing SST scope on delete",
+                        mutation_id=deletion.mutation_id,
+                        correlation_id=context.correlation_id,
+                    ),
+                )
+            parsed = _parse_scope(dict(deletion.scopes[0]))
+            if parsed is None:
+                return _all_failed_ids(
+                    all_ids,
+                    SafeConnectorError(
+                        code="DESTINATION_INVALID",
+                        message="SST scope.stage is required",
+                        mutation_id=deletion.mutation_id,
+                        correlation_id=context.correlation_id,
+                    ),
+                )
+            delete_partitions[parsed].append(deletion)
+
         try:
             await self._ensure_command(config, cwd)
         except ProcessRunnerError as exc:
-            return _all_failed(request.mutations, exc.safe)
+            return _all_failed_ids(all_ids, exc.safe)
 
         assert self._resolved_executable is not None
         child_env = build_minimal_child_env(self.environ)
@@ -184,7 +303,19 @@ class SstDestination:
             requests_made += n
             results.update(part_results)
 
-        ordered = tuple(results[m.mutation_id] for m in request.mutations)
+        for (stage, fallback), deletions in delete_partitions.items():
+            part_results, n = await self._individual_removes(
+                cwd=cwd,
+                stage=stage,
+                fallback=fallback,
+                deletes=deletions,
+                child_env=child_env,
+                correlation_id=context.correlation_id,
+            )
+            requests_made += n
+            results.update(part_results)
+
+        ordered = tuple(results[mid] for mid in all_ids)
         return ApplyDestinationResult(results=ordered, requests_made=requests_made)
 
     async def _ensure_command(self, config: Mapping[str, JsonValue], cwd: Path) -> None:
@@ -334,6 +465,64 @@ class SstDestination:
                 )
         return results, requests
 
+    async def _individual_removes(
+        self,
+        *,
+        cwd: Path,
+        stage: str,
+        fallback: bool,
+        deletes: Sequence[DeleteMutation],
+        child_env: Mapping[str, str],
+        correlation_id: str,
+    ) -> tuple[dict[str, MutationResult], int]:
+        assert self._resolved_executable is not None
+        results: dict[str, MutationResult] = {}
+        requests = 0
+        for deletion in deletes:
+            args = [*self._argv_prefix, "secret", "remove", deletion.name, "--stage", stage]
+            if fallback:
+                args.append("--fallback")
+            req = SecureProcessRequest(
+                executable=self._resolved_executable,
+                arguments=tuple(args),
+                cwd=cwd,
+                environment=dict(child_env),
+            )
+            requests += 1
+            try:
+                result = await self.process_runner.execute(req)
+            except ProcessRunnerError as exc:
+                results[deletion.mutation_id] = MutationResult(
+                    mutation_id=deletion.mutation_id,
+                    status="failed",
+                    error=SafeConnectorError(
+                        code=exc.safe.code,
+                        message=exc.safe.message,
+                        mutation_id=deletion.mutation_id,
+                        correlation_id=correlation_id,
+                    ),
+                )
+                continue
+            if result.exit_code != 0:
+                results[deletion.mutation_id] = MutationResult(
+                    mutation_id=deletion.mutation_id,
+                    status="failed",
+                    error=SafeConnectorError(
+                        code="PROCESS_FAILED",
+                        message="SST secret remove failed",
+                        mutation_id=deletion.mutation_id,
+                        correlation_id=correlation_id,
+                        hint=result.stderr_summary or None,
+                    ),
+                )
+            else:
+                results[deletion.mutation_id] = MutationResult(
+                    mutation_id=deletion.mutation_id,
+                    status="applied",
+                    effect="deleted",
+                )
+        return results, requests
+
 
 def _fanout_failed(
     mutations: Sequence[PutMutation],
@@ -357,13 +546,12 @@ def _fanout_failed(
     }
 
 
-def _all_failed(
-    mutations: Sequence[PutMutation], error: SafeConnectorError
+def _all_failed_ids(
+    mutation_ids: Sequence[str], error: SafeConnectorError
 ) -> ApplyDestinationResult:
     return ApplyDestinationResult(
         results=tuple(
-            MutationResult(mutation_id=m.mutation_id, status="failed", error=error)
-            for m in mutations
+            MutationResult(mutation_id=mid, status="failed", error=error) for mid in mutation_ids
         ),
         requests_made=0,
     )

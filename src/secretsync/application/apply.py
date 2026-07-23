@@ -13,13 +13,14 @@ from typing import Any, Literal
 
 import anyio
 
-from secretsync.application.plan import build_plan
+from secretsync.application.plan import build_plan_async
 from secretsync.application.services import AppServices
 from secretsync.application.validate import ValidationIssue, validate_config
 from secretsync.config.models import RootConfig
 from secretsync.destinations.base import (
     ApplyDestinationRequest,
     ApplyDestinationResult,
+    DeleteMutation,
     MutationResult,
     OperationContext,
     PutMutation,
@@ -37,7 +38,7 @@ from secretsync.domain.errors import (
     UnknownConnectorError,
     exit_code_for,
 )
-from secretsync.domain.models import JsonValue, Plan, PlannedPut
+from secretsync.domain.models import JsonValue, Plan, PlannedDelete, PlannedPut
 from secretsync.infrastructure.redaction import scrub_bytearray
 
 
@@ -95,6 +96,7 @@ def run_apply(
     mutation_ids: frozenset[str] | None = None,
     deployments: set[str] | None = None,
     destinations: set[str] | None = None,
+    prune: bool = False,
 ) -> ApplyReport:
     """Synchronous entry used by Click; runs the async coordinator."""
 
@@ -109,6 +111,7 @@ def run_apply(
             mutation_ids=mutation_ids,
             deployments=deployments,
             destinations=destinations,
+            prune=prune,
         )
 
     return anyio.run(_runner)
@@ -125,6 +128,7 @@ async def run_apply_async(
     mutation_ids: frozenset[str] | None = None,
     deployments: set[str] | None = None,
     destinations: set[str] | None = None,
+    prune: bool = False,
 ) -> ApplyReport:
     """Async apply entry used by the Textual TUI workers."""
     from loguru import logger
@@ -179,21 +183,37 @@ async def run_apply_async(
             ),
         )
 
-    plan = build_plan(
-        config,
-        validation.composed_sets,
-        deployments=deployments,
-        destinations=destinations,
+    try:
+        plan = await build_plan_async(
+            services,
+            config,
+            validation.composed_sets,
+            prune=prune,
+            deployments=deployments,
+            destinations=destinations,
+        )
+    except SecretSyncError as exc:
+        return ApplyReport(
+            exit_code=exit_code_for(exc),
+            started_at=started,
+            completed_at=services.clock.now(),
+            error=exc.safe,
+        )
+    logger.info(
+        "Apply plan has {} put(s) and {} delete(s)",
+        len(plan.puts),
+        len(plan.deletes),
     )
-    logger.info("Apply plan has {} put(s)", len(plan.puts))
     if mutation_ids is not None:
-        filtered = tuple(put for put in plan.puts if put.mutation_id in mutation_ids)
-        plan = Plan(strategy=plan.strategy, puts=filtered)
+        filtered_puts = tuple(put for put in plan.puts if put.mutation_id in mutation_ids)
+        filtered_deletes = tuple(d for d in plan.deletes if d.mutation_id in mutation_ids)
+        plan = Plan(strategy=plan.strategy, puts=filtered_puts, deletes=filtered_deletes)
 
     if confirm:
         from secretsync.presentation.human import render_plan_human
 
-        prompt = render_plan_human(plan) + "\n\nApply all listed writes?"
+        action = "writes and deletes" if plan.deletes else "writes"
+        prompt = render_plan_human(plan) + f"\n\nApply all listed {action}?"
         accepted = (confirm_fn or _default_confirm)(prompt)
         if not accepted:
             return ApplyReport(
@@ -201,7 +221,7 @@ async def run_apply_async(
                 strategy=plan.strategy,
                 started_at=started,
                 completed_at=services.clock.now(),
-                summary=ApplySummary(0, 0, len(plan.puts)),
+                summary=ApplySummary(0, 0, len(plan.puts) + len(plan.deletes)),
             )
 
     try:
@@ -302,6 +322,8 @@ def _destination_order(plan: Plan) -> dict[str, int]:
     order: dict[str, int] = {}
     for put in plan.puts:
         order.setdefault(put.target.destination_id, len(order))
+    for deletion in plan.deletes:
+        order.setdefault(deletion.target.destination_id, len(order))
     return order
 
 
@@ -313,14 +335,22 @@ async def _apply_plan(
     *,
     on_destination_progress: ProgressFn | None = None,
 ) -> list[DestinationApplyBlock]:
-    by_destination: dict[str, list[PlannedPut]] = defaultdict(list)
+    puts_by_destination: dict[str, list[PlannedPut]] = defaultdict(list)
+    deletes_by_destination: dict[str, list[PlannedDelete]] = defaultdict(list)
     for put in plan.puts:
-        by_destination[put.target.destination_id].append(put)
+        puts_by_destination[put.target.destination_id].append(put)
+    for deletion in plan.deletes:
+        deletes_by_destination[deletion.target.destination_id].append(deletion)
+
+    destination_ids = sorted(
+        set(puts_by_destination) | set(deletes_by_destination),
+        key=lambda d: _destination_order(plan).get(d, 10_000),
+    )
 
     limiter = anyio.CapacityLimiter(max_concurrency)
     results: dict[str, DestinationApplyBlock] = {}
 
-    async def run_one(destination_id: str, puts: list[PlannedPut]) -> None:
+    async def run_one(destination_id: str) -> None:
         connector_id = config.destinations[destination_id].connector
         async with limiter:
             if on_destination_progress is not None:
@@ -331,7 +361,13 @@ async def _apply_plan(
                         phase="started",
                     )
                 )
-            block = await _apply_destination(services, config, destination_id, puts)
+            block = await _apply_destination(
+                services,
+                config,
+                destination_id,
+                puts_by_destination.get(destination_id, []),
+                deletes_by_destination.get(destination_id, []),
+            )
             results[destination_id] = block
             if on_destination_progress is not None:
                 part = _summarize([block])
@@ -347,8 +383,8 @@ async def _apply_plan(
                 )
 
     async with anyio.create_task_group() as tg:
-        for destination_id, puts in by_destination.items():
-            tg.start_soon(run_one, destination_id, puts)
+        for destination_id in destination_ids:
+            tg.start_soon(run_one, destination_id)
 
     return list(results.values())
 
@@ -358,13 +394,14 @@ async def _apply_destination(
     config: RootConfig,
     destination_id: str,
     puts: list[PlannedPut],
+    deletes: list[PlannedDelete],
 ) -> DestinationApplyBlock:
     destination_def = config.destinations[destination_id]
     connector_id = destination_def.connector
     destination = services.connectors.create(connector_id, services)
     dest_config = _destination_config_map(destination_def)
 
-    # Preserve plan order of deployments within this destination.
+    # Preserve plan order of deployments within this destination for puts.
     by_deployment: dict[str, list[PlannedPut]] = defaultdict(list)
     deployment_order: list[str] = []
     for put in puts:
@@ -372,12 +409,27 @@ async def _apply_destination(
             deployment_order.append(put.deployment_id)
         by_deployment[put.deployment_id].append(put)
 
+    deletes_by_deployment: dict[str, list[PlannedDelete]] = defaultdict(list)
+    for deletion in deletes:
+        deletes_by_deployment[deletion.deployment_id].append(deletion)
+        if deletion.deployment_id not in deployment_order:
+            deployment_order.append(deletion.deployment_id)
+
     all_results: list[MutationResult] = []
     requests_made = 0
 
     for deployment_id in deployment_order:
-        deployment_puts = by_deployment[deployment_id]
+        deployment_puts = by_deployment.get(deployment_id, [])
+        deployment_deletes = deletes_by_deployment.get(deployment_id, [])
         mutations: list[PutMutation] = []
+        delete_mutations: list[DeleteMutation] = [
+            DeleteMutation(
+                mutation_id=d.mutation_id,
+                name=d.target.name,
+                scopes=(dict(d.target.scope),),
+            )
+            for d in deployment_deletes
+        ]
         try:
             for put in deployment_puts:
                 material = await services.source.resolve(put.source)
@@ -394,6 +446,7 @@ async def _apply_destination(
                 deployment_id=deployment_id,
                 destination_config=dest_config,
                 mutations=mutations,
+                deletes=delete_mutations,
             )
             try:
                 outcome = await destination.apply(request, context)
@@ -438,15 +491,16 @@ def _failure_result_for_request(
         message=message,
         correlation_id=correlation_id,
     )
+    ids = [m.mutation_id for m in request.mutations] + [d.mutation_id for d in request.deletes]
     return ApplyDestinationResult(
         results=tuple(
             MutationResult(
-                mutation_id=m.mutation_id,
+                mutation_id=mid,
                 status="failed",
                 effect=None,
                 error=error,
             )
-            for m in request.mutations
+            for mid in ids
         ),
         requests_made=1,
     )
@@ -459,20 +513,22 @@ def _correlate_results(
 ) -> list[MutationResult]:
     by_id = {r.mutation_id: r for r in outcome.results}
     correlated: list[MutationResult] = []
-    for mutation in request.mutations:
-        existing = by_id.get(mutation.mutation_id)
+    for mutation_id in [m.mutation_id for m in request.mutations] + [
+        d.mutation_id for d in request.deletes
+    ]:
+        existing = by_id.get(mutation_id)
         if existing is not None:
             correlated.append(existing)
             continue
         correlated.append(
             MutationResult(
-                mutation_id=mutation.mutation_id,
+                mutation_id=mutation_id,
                 status="failed",
                 effect=None,
                 error=SafeConnectorError(
                     code="DESTINATION_INVALID",
                     message="Connector omitted result for mutation",
-                    mutation_id=mutation.mutation_id,
+                    mutation_id=mutation_id,
                     correlation_id=correlation_id,
                 ),
             )

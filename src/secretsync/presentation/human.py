@@ -23,9 +23,17 @@ def render_plan_human(plan: Plan) -> str:
         "SecretSync plan (always-write)",
         "Every listed target will be written. Values are never displayed.",
         f"Strategy: {plan.strategy}",
-        f"Mutations: {len(plan.puts)}",
+        f"Puts: {len(plan.puts)}  Deletes: {len(plan.deletes)}",
         "",
     ]
+    if plan.deletes:
+        lines.extend(
+            [
+                "WARNING: --prune treats YAML as the full desired inventory for each",
+                "destination scope. Remote secrets not listed in YAML will be deleted.",
+                "",
+            ]
+        )
     current_deployment: str | None = None
     for put in plan.puts:
         if put.deployment_id != current_deployment:
@@ -33,10 +41,20 @@ def render_plan_human(plan: Plan) -> str:
             lines.append(f"Deployment: {put.deployment_id}")
         scope = dict(put.target.scope)
         lines.append(
-            f"  - {put.mutation_id}: {put.source.logical_id} "
+            f"  - put {put.mutation_id}: {put.source.logical_id} "
             f"-> {put.target.destination_id}/{put.target.name} "
             f"[{put.target.connector_id}] scope={scope}"
         )
+    if plan.deletes:
+        lines.append("")
+        lines.append("Deletes:")
+        for deletion in plan.deletes:
+            scope = dict(deletion.target.scope)
+            lines.append(
+                f"  - delete {deletion.mutation_id}: "
+                f"{deletion.target.destination_id}/{deletion.target.name} "
+                f"[{deletion.target.connector_id}] scope={scope}"
+            )
     return "\n".join(lines)
 
 

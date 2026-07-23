@@ -35,6 +35,7 @@ def plan_to_dict(plan: Plan) -> dict[str, Any]:
                 "id": put.target.destination_id,
                 "connector": put.target.connector_id,
                 "puts": [],
+                "deletes": [],
             },
         )
         dest["puts"].append(
@@ -48,10 +49,30 @@ def plan_to_dict(plan: Plan) -> dict[str, Any]:
                 "operation": "put",
             }
         )
+    for deletion in plan.deletes:
+        dest = destinations.setdefault(
+            deletion.target.destination_id,
+            {
+                "id": deletion.target.destination_id,
+                "connector": deletion.target.connector_id,
+                "puts": [],
+                "deletes": [],
+            },
+        )
+        dest.setdefault("deletes", [])
+        dest["deletes"].append(
+            {
+                "mutationId": deletion.mutation_id,
+                "deployment": deletion.deployment_id,
+                "name": deletion.target.name,
+                "scopes": [dict(deletion.target.scope)],
+                "operation": "delete",
+            }
+        )
     return {
         "schemaVersion": 1,
         "strategy": plan.strategy,
-        "summary": {"puts": len(plan.puts)},
+        "summary": {"puts": len(plan.puts), "deletes": len(plan.deletes)},
         "destinations": list(destinations.values()),
     }
 

@@ -1,0 +1,23 @@
+version: 1
+changeDetection: always-write
+secrets:
+  databaseUrl:
+    env: YB_DATABASE_URL
+  stripeSecretKey:
+    env: STRIPE_SECRET_KEY
+sets:
+  app:
+    include: [databaseUrl, stripeSecretKey]
+destinations:
+  pruneSink:
+    connector: fake-prune
+    label: prune
+deployments:
+  - name: prune-prod
+    set: app
+    destination: pruneSink
+    scope:
+      stage: production
+    secrets:
+      databaseUrl: DATABASE_URL
+      stripeSecretKey: STRIPE_SECRET_KEY

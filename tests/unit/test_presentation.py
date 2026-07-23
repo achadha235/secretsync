@@ -95,11 +95,13 @@ def test_plan_human_and_json_group_by_deployment() -> None:
     assert "Deployment: prod" in human
     assert "Deployment: staging" in human
     assert "m1:" in human and "m3:" in human
+    assert "put m1:" in human
     assert CANARY not in human
     assert CANARY not in render_plan_json(plan)
 
     data = plan_to_dict(plan)
     assert data["summary"]["puts"] == 3
+    assert data["summary"]["deletes"] == 0
     assert data["strategy"] == "always-write"
     dest_ids = {d["id"] for d in data["destinations"]}
     assert dest_ids == {"gh", "vc"}

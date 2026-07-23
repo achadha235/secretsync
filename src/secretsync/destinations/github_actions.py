@@ -16,9 +16,11 @@ from secretsync.destinations.base import (
     ApplyDestinationRequest,
     ApplyDestinationResult,
     BatchCapability,
+    DeleteMutation,
     DestinationCapabilities,
     DestinationManifest,
     Issue,
+    ListNamesError,
     MutationResult,
     OperationContext,
     PutMutation,
@@ -40,7 +42,7 @@ def _capabilities() -> DestinationCapabilities:
         read_values=False,
         put_semantics=PutSemantics.UPSERT,
         put_batch=BatchCapability(supported=False),
-        delete_batch=BatchCapability(supported=False),
+        delete_batch=BatchCapability(supported=True, max_items=1),
         multiple_scopes_per_mutation=False,
         batch_across_scopes=False,
     )
@@ -103,6 +105,98 @@ class GitHubActionsDestination:
             )
         return issues
 
+    async def list_names(
+        self,
+        config: Mapping[str, JsonValue],
+        scope: Mapping[str, JsonValue],
+        context: OperationContext,
+    ) -> frozenset[str]:
+        parsed = _parse_repository(config)
+        token_env = _token_env(config)
+        if parsed is None or token_env is None:
+            raise ListNamesError(
+                SafeConnectorError(
+                    code="DESTINATION_INVALID",
+                    message="Invalid github-actions destination configuration",
+                    correlation_id=context.correlation_id,
+                )
+            )
+        token = self.environ.get(token_env)
+        if not token:
+            raise ListNamesError(
+                SafeConnectorError(
+                    code="AUTH_MISSING",
+                    message=f"Connector credential environment variable '{token_env}' is absent",
+                    correlation_id=context.correlation_id,
+                )
+            )
+        kind = scope.get("kind")
+        if kind == "organization":
+            raise ListNamesError(
+                SafeConnectorError(
+                    code="DESTINATION_INVALID",
+                    message="Organization secrets are not supported in MVP",
+                    correlation_id=context.correlation_id,
+                )
+            )
+        if kind == "environment" and not scope.get("environment"):
+            raise ListNamesError(
+                SafeConnectorError(
+                    code="DESTINATION_INVALID",
+                    message="Invalid GitHub scope; environment name required",
+                    correlation_id=context.correlation_id,
+                )
+            )
+        if kind not in {"repository", "environment"}:
+            raise ListNamesError(
+                SafeConnectorError(
+                    code="DESTINATION_INVALID",
+                    message="Invalid GitHub scope; require kind repository|environment",
+                    correlation_id=context.correlation_id,
+                )
+            )
+
+        owner, repo = parsed
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        client = self.http_client_factory.create(headers=headers)
+        names: set[str] = set()
+        try:
+            async with client:
+                page = 1
+                while True:
+                    url = _secrets_collection_url(owner, repo, scope)
+                    response = await request_with_retries(
+                        client,
+                        "GET",
+                        url,
+                        params={"per_page": "100", "page": str(page)},
+                        correlation_id=context.correlation_id,
+                    )
+                    if response.status_code != 200:
+                        from secretsync.infrastructure.http import error_for_status
+
+                        raise ListNamesError(
+                            error_for_status(
+                                response.status_code, correlation_id=context.correlation_id
+                            )
+                        )
+                    payload = response.json()
+                    secrets = payload.get("secrets", []) if isinstance(payload, dict) else []
+                    if isinstance(secrets, list):
+                        for item in secrets:
+                            if isinstance(item, dict) and "name" in item:
+                                names.add(str(item["name"]))
+                    if not isinstance(secrets, list) or len(secrets) < 100:
+                        break
+                    page += 1
+        except HttpRequestError as exc:
+            raise ListNamesError(exc.safe) from exc
+        return frozenset(names)
+
     async def apply(
         self,
         request: ApplyDestinationRequest,
@@ -111,6 +205,9 @@ class GitHubActionsDestination:
         config = request.destination_config
         parsed = _parse_repository(config)
         token_env = _token_env(config)
+        all_ids = [m.mutation_id for m in request.mutations] + [
+            d.mutation_id for d in request.deletes
+        ]
         if parsed is None or token_env is None:
             error = SafeConnectorError(
                 code="DESTINATION_INVALID",
@@ -118,9 +215,7 @@ class GitHubActionsDestination:
                 correlation_id=context.correlation_id,
             )
             return ApplyDestinationResult(
-                results=tuple(
-                    MutationResult(m.mutation_id, "failed", None, error) for m in request.mutations
-                ),
+                results=tuple(MutationResult(mid, "failed", None, error) for mid in all_ids),
                 requests_made=0,
             )
 
@@ -132,9 +227,7 @@ class GitHubActionsDestination:
                 correlation_id=context.correlation_id,
             )
             return ApplyDestinationResult(
-                results=tuple(
-                    MutationResult(m.mutation_id, "failed", None, error) for m in request.mutations
-                ),
+                results=tuple(MutationResult(mid, "failed", None, error) for mid in all_ids),
                 requests_made=0,
             )
 
@@ -192,69 +285,72 @@ class GitHubActionsDestination:
         }
         client = self.http_client_factory.create(headers=headers)
         limiter = anyio.CapacityLimiter(self.put_concurrency)
-        try:
-            async with client:
-                for scope_id, mutations in by_scope.items():
-                    if scope_id in {"organization", "invalid"}:
-                        continue
-                    scope = dict(mutations[0].scopes[0])
-                    try:
-                        key_id, key_b64, key_requests = await self._get_public_key(
-                            client, owner, repo, scope, context.correlation_id
+        async with client:
+            for scope_id, mutations in by_scope.items():
+                if scope_id in {"organization", "invalid"}:
+                    continue
+                scope = dict(mutations[0].scopes[0])
+                try:
+                    key_id, key_b64, key_requests = await self._get_public_key(
+                        client, owner, repo, scope, context.correlation_id
+                    )
+                    requests_made += key_requests
+                except HttpRequestError as exc:
+                    for mutation in mutations:
+                        results[mutation.mutation_id] = MutationResult(
+                            mutation_id=mutation.mutation_id,
+                            status="failed",
+                            error=exc.safe,
                         )
-                        requests_made += key_requests
-                    except HttpRequestError as exc:
-                        for mutation in mutations:
-                            results[mutation.mutation_id] = MutationResult(
-                                mutation_id=mutation.mutation_id,
-                                status="failed",
-                                error=exc.safe,
-                            )
-                        continue
+                    continue
 
-                    async def put_one(
-                        mutation: PutMutation,
-                        put_scope: dict[str, JsonValue],
-                        put_key_id: str,
-                        put_key_b64: str,
-                    ) -> None:
-                        nonlocal requests_made
-                        async with limiter:
-                            result, n = await self._put_secret(
-                                client,
-                                owner,
-                                repo,
-                                put_scope,
-                                mutation,
-                                put_key_id,
-                                put_key_b64,
-                                context.correlation_id,
-                            )
-                            results[mutation.mutation_id] = result
-                            requests_made += n
+                async def put_one(
+                    mutation: PutMutation,
+                    put_scope: dict[str, JsonValue],
+                    put_key_id: str,
+                    put_key_b64: str,
+                ) -> None:
+                    nonlocal requests_made
+                    async with limiter:
+                        result, n = await self._put_secret(
+                            client,
+                            owner,
+                            repo,
+                            put_scope,
+                            mutation,
+                            put_key_id,
+                            put_key_b64,
+                            context.correlation_id,
+                        )
+                        results[mutation.mutation_id] = result
+                        requests_made += n
 
-                    async with anyio.create_task_group() as tg:
-                        for mutation in mutations:
-                            tg.start_soon(put_one, mutation, scope, key_id, key_b64)
-        finally:
-            # Token must not linger in headers dict we created; client closed above.
-            pass
+                async with anyio.create_task_group() as tg:
+                    for mutation in mutations:
+                        tg.start_soon(put_one, mutation, scope, key_id, key_b64)
+
+            for deletion in request.deletes:
+                result, n = await self._delete_secret(
+                    client, owner, repo, deletion, context.correlation_id
+                )
+                results[deletion.mutation_id] = result
+                requests_made += n
 
         ordered = tuple(
             results.get(
-                m.mutation_id,
+                mid,
                 MutationResult(
-                    mutation_id=m.mutation_id,
+                    mutation_id=mid,
                     status="failed",
                     error=SafeConnectorError(
                         code="DESTINATION_INVALID",
                         message="Connector omitted result for mutation",
-                        mutation_id=m.mutation_id,
+                        mutation_id=mid,
                         correlation_id=context.correlation_id,
                     ),
                 ),
             )
-            for m in request.mutations
+            for mid in all_ids
         )
         return ApplyDestinationResult(results=ordered, requests_made=requests_made)
 
@@ -382,6 +478,132 @@ class GitHubActionsDestination:
             )
         finally:
             scrub_bytearray(ciphertext)
+
+    async def _delete_secret(
+        self,
+        client: Any,
+        owner: str,
+        repo: str,
+        deletion: DeleteMutation,
+        correlation_id: str,
+    ) -> tuple[MutationResult, int]:
+        if not deletion.scopes:
+            return (
+                MutationResult(
+                    mutation_id=deletion.mutation_id,
+                    status="failed",
+                    error=SafeConnectorError(
+                        code="DESTINATION_INVALID",
+                        message="Missing GitHub scope on delete",
+                        mutation_id=deletion.mutation_id,
+                        correlation_id=correlation_id,
+                    ),
+                ),
+                0,
+            )
+        scope = dict(deletion.scopes[0])
+        kind = scope.get("kind")
+        if kind == "organization":
+            return (
+                MutationResult(
+                    mutation_id=deletion.mutation_id,
+                    status="failed",
+                    error=SafeConnectorError(
+                        code="DESTINATION_INVALID",
+                        message="Organization secrets are not supported in MVP",
+                        mutation_id=deletion.mutation_id,
+                        correlation_id=correlation_id,
+                    ),
+                ),
+                0,
+            )
+        if kind not in {"repository", "environment"} or (
+            kind == "environment" and not scope.get("environment")
+        ):
+            return (
+                MutationResult(
+                    mutation_id=deletion.mutation_id,
+                    status="failed",
+                    error=SafeConnectorError(
+                        code="DESTINATION_INVALID",
+                        message="Invalid GitHub scope; require kind repository|environment",
+                        mutation_id=deletion.mutation_id,
+                        correlation_id=correlation_id,
+                    ),
+                ),
+                0,
+            )
+        if not SECRET_NAME_RE.match(deletion.name):
+            return (
+                MutationResult(
+                    mutation_id=deletion.mutation_id,
+                    status="failed",
+                    error=SafeConnectorError(
+                        code="DESTINATION_INVALID",
+                        message=f"Invalid GitHub secret name '{deletion.name}'",
+                        mutation_id=deletion.mutation_id,
+                        correlation_id=correlation_id,
+                    ),
+                ),
+                0,
+            )
+        url = _secret_item_url(owner, repo, scope, deletion.name)
+        try:
+            response = await request_with_retries(
+                client,
+                "DELETE",
+                url,
+                mutation_id=deletion.mutation_id,
+                correlation_id=correlation_id,
+            )
+            if response.status_code in {204, 404}:
+                return (
+                    MutationResult(
+                        mutation_id=deletion.mutation_id,
+                        status="applied",
+                        effect="deleted",
+                    ),
+                    1,
+                )
+            from secretsync.infrastructure.http import error_for_status
+
+            return (
+                MutationResult(
+                    mutation_id=deletion.mutation_id,
+                    status="failed",
+                    error=error_for_status(
+                        response.status_code,
+                        mutation_id=deletion.mutation_id,
+                        correlation_id=correlation_id,
+                    ),
+                ),
+                1,
+            )
+        except HttpRequestError as exc:
+            return (
+                MutationResult(
+                    mutation_id=deletion.mutation_id,
+                    status="failed",
+                    error=exc.safe,
+                ),
+                1,
+            )
+
+
+def _secrets_collection_url(owner: str, repo: str, scope: Mapping[str, JsonValue]) -> str:
+    kind = scope.get("kind")
+    if kind == "environment":
+        env_name = quote(str(scope["environment"]), safe="")
+        return f"{GITHUB_API}/repos/{owner}/{repo}/environments/{env_name}/secrets"
+    return f"{GITHUB_API}/repos/{owner}/{repo}/actions/secrets"
+
+
+def _secret_item_url(owner: str, repo: str, scope: Mapping[str, JsonValue], name: str) -> str:
+    kind = scope.get("kind")
+    if kind == "environment":
+        env_name = quote(str(scope["environment"]), safe="")
+        return f"{GITHUB_API}/repos/{owner}/{repo}/environments/{env_name}/secrets/{name}"
+    return f"{GITHUB_API}/repos/{owner}/{repo}/actions/secrets/{name}"
 
 
 @dataclass(frozen=True, slots=True)

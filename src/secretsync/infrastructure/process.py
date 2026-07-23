@@ -57,6 +57,7 @@ class SecureProcessRequest:
     env_file: EnvFileInput | None = None
     stdin_bytes: bytes | bytearray | None = None
     timeout_seconds: float = 30.0
+    capture_stdout: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +65,7 @@ class ProcessResult:
     exit_code: int
     duration_ms: int
     stderr_summary: str = ""
+    stdout_bytes: bytes = b""
 
 
 class ProcessRunnerError(Exception):
@@ -162,6 +164,7 @@ class AsyncSecureProcessRunner:
             exit_code=result.exit_code,
             duration_ms=duration_ms,
             stderr_summary=result.stderr_summary,
+            stdout_bytes=result.stdout_bytes,
         )
 
     def _execute_plain_sync(self, request: SecureProcessRequest) -> ProcessResult:
@@ -170,13 +173,15 @@ class AsyncSecureProcessRunner:
             [str(request.executable), *request.arguments],
             cwd=str(request.cwd),
             env=dict(request.environment),
-            stdout=subprocess.DEVNULL,
+            stdout=subprocess.PIPE if request.capture_stdout else subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             stdin=subprocess.PIPE if stdin_payload is not None else subprocess.DEVNULL,
             close_fds=True,
         )
         try:
-            _, stderr_b = proc.communicate(input=stdin_payload, timeout=request.timeout_seconds)
+            stdout_b, stderr_b = proc.communicate(
+                input=stdin_payload, timeout=request.timeout_seconds
+            )
         except subprocess.TimeoutExpired as exc:
             proc.kill()
             proc.wait()
@@ -185,6 +190,7 @@ class AsyncSecureProcessRunner:
             exit_code=int(proc.returncode or 0),
             duration_ms=0,
             stderr_summary=_stderr_summary(stderr_b, _secrets_from_request(request)),
+            stdout_bytes=stdout_b or b"",
         )
 
     def _execute_with_env_file_sync(self, request: SecureProcessRequest) -> ProcessResult:

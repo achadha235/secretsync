@@ -12,6 +12,7 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
 from textual.widgets import (
     Button,
+    Checkbox,
     DataTable,
     Footer,
     Header,
@@ -28,9 +29,9 @@ from secretsync.application.apply import (
     DestinationProgress,
     run_apply_async,
 )
-from secretsync.application.plan import plan_from_path
+from secretsync.application.plan import plan_from_path_async
 from secretsync.application.validate import ValidationResult, validate_config
-from secretsync.domain.models import Plan, PlannedPut
+from secretsync.domain.models import Plan, PlannedDelete, PlannedPut
 from secretsync.presentation.json import render_apply_json
 
 if TYPE_CHECKING:
@@ -128,6 +129,10 @@ class PlanScreen(Screen[None]):
         yield Header()
         with Vertical(id="body"):
             yield Label("Plan (always-write)", classes="title")
+            yield Checkbox(
+                "Prune: delete remote secrets not listed in YAML",
+                id="prune-toggle",
+            )
             yield Label("Filter (destination / name / env)")
             yield Input(placeholder="filter…", id="filter-input")
             yield Tree("destinations", id="plan-tree")
@@ -138,6 +143,7 @@ class PlanScreen(Screen[None]):
         yield Footer()
 
     def on_mount(self) -> None:
+        self.query_one("#prune-toggle", Checkbox).value = _app(self).prune
         self._load_plan()
 
     def action_reload(self) -> None:
@@ -154,6 +160,11 @@ class PlanScreen(Screen[None]):
     def on_continue(self) -> None:
         self.app.push_screen(ConfirmScreen())
 
+    @on(Checkbox.Changed, "#prune-toggle")
+    def on_prune_changed(self, event: Checkbox.Changed) -> None:
+        _app(self).prune = event.value
+        self._load_plan()
+
     @on(Input.Changed, "#filter-input")
     def on_filter_changed(self, event: Input.Changed) -> None:
         plan = _app(self).plan
@@ -163,7 +174,9 @@ class PlanScreen(Screen[None]):
     @work(exclusive=True, group="plan")
     async def _load_plan(self) -> None:
         app = _app(self)
-        plan, validation = plan_from_path(app.services, app.config_path)
+        plan, validation = await plan_from_path_async(
+            app.services, app.config_path, prune=app.prune
+        )
         if plan is None:
             self.query_one("#plan-summary", Label).update(
                 f"Status: FAIL — cannot build plan ({validation.exit_code})"
@@ -174,7 +187,8 @@ class PlanScreen(Screen[None]):
         app.retry_mutation_ids = None
         self._populate_tree(plan, self.query_one("#filter-input", Input).value.strip().lower())
         self.query_one("#plan-summary", Label).update(
-            f"Status: OK — {len(plan.puts)} put(s), strategy={plan.strategy}"
+            f"Status: OK — {len(plan.puts)} put(s), {len(plan.deletes)} delete(s), "
+            f"strategy={plan.strategy}"
         )
         self.query_one("#continue", Button).disabled = False
 
@@ -183,29 +197,43 @@ class PlanScreen(Screen[None]):
         tree.clear()
         tree.root.expand()
         by_dest: dict[str, list[PlannedPut]] = defaultdict(list)
+        deletes_by_dest: dict[str, list[PlannedDelete]] = defaultdict(list)
         for put in plan.puts:
             by_dest[put.target.destination_id].append(put)
+        for deletion in plan.deletes:
+            deletes_by_dest[deletion.target.destination_id].append(deletion)
 
-        for dest_id, puts in sorted(by_dest.items()):
-            connector = puts[0].target.connector_id
-            visible = [p for p in puts if self._matches(p, needle)]
-            if needle and not visible:
+        for dest_id in sorted(set(by_dest) | set(deletes_by_dest)):
+            puts = by_dest.get(dest_id, [])
+            dels = deletes_by_dest.get(dest_id, [])
+            connector = (puts or dels)[0].target.connector_id
+            visible_puts = [p for p in puts if self._matches_put(p, needle)]
+            visible_dels = [d for d in dels if self._matches_delete(d, needle)]
+            if needle and not visible_puts and not visible_dels:
                 continue
             dest_node: TreeNode[None] = tree.root.add(
-                f"{dest_id} [{connector}] — {len(visible)} put(s)",
+                f"{dest_id} [{connector}] — {len(visible_puts)} put(s), "
+                f"{len(visible_dels)} delete(s)",
                 expand=True,
             )
             by_deploy: dict[str, list[PlannedPut]] = defaultdict(list)
-            for put in visible:
+            for put in visible_puts:
                 by_deploy[put.deployment_id].append(put)
             for deploy_id, deploy_puts in sorted(by_deploy.items()):
                 deploy_node = dest_node.add(f"deployment: {deploy_id}", expand=True)
                 for put in deploy_puts:
                     scope = dict(put.target.scope)
-                    deploy_node.add_leaf(f"{put.target.name} ← {put.source.env_name} scope={scope}")
+                    deploy_node.add_leaf(
+                        f"put {put.target.name} ← {put.source.env_name} scope={scope}"
+                    )
+            if visible_dels:
+                del_node = dest_node.add("deletes", expand=True)
+                for deletion in visible_dels:
+                    scope = dict(deletion.target.scope)
+                    del_node.add_leaf(f"delete {deletion.target.name} scope={scope}")
 
     @staticmethod
-    def _matches(put: PlannedPut, needle: str) -> bool:
+    def _matches_put(put: PlannedPut, needle: str) -> bool:
         if not needle:
             return True
         hay = " ".join(
@@ -217,6 +245,22 @@ class PlanScreen(Screen[None]):
                 put.source.env_name,
                 put.source.logical_id,
                 str(dict(put.target.scope)),
+            ]
+        ).lower()
+        return needle in hay
+
+    @staticmethod
+    def _matches_delete(deletion: PlannedDelete, needle: str) -> bool:
+        if not needle:
+            return True
+        hay = " ".join(
+            [
+                deletion.target.destination_id,
+                deletion.target.connector_id,
+                deletion.deployment_id,
+                deletion.target.name,
+                str(dict(deletion.target.scope)),
+                "delete",
             ]
         ).lower()
         return needle in hay
@@ -238,6 +282,12 @@ class ConfirmScreen(Screen[None]):
                 classes="warning",
                 id="always-write-warning",
             )
+            yield Static(
+                "WARNING: prune — remote secrets not listed in YAML for each "
+                "destination scope will be deleted.",
+                classes="warning",
+                id="prune-warning",
+            )
             yield RichLog(id="confirm-destinations", markup=False, highlight=False)
             with Horizontal(classes="button-row"):
                 yield Button("Cancel", id="cancel", variant="default")
@@ -252,19 +302,33 @@ class ConfirmScreen(Screen[None]):
             self.query_one("#apply", Button).disabled = True
             return
         puts = plan.puts
+        deletes = plan.deletes
         if app.retry_mutation_ids is not None:
             puts = tuple(p for p in puts if p.mutation_id in app.retry_mutation_ids)
-        dests = sorted({p.target.destination_id for p in puts})
+            deletes = tuple(d for d in deletes if d.mutation_id in app.retry_mutation_ids)
+        dests = sorted(
+            {p.target.destination_id for p in puts} | {d.target.destination_id for d in deletes}
+        )
         mode = "retry-failures" if app.retry_mutation_ids is not None else "full"
         self.query_one("#confirm-summary", Label).update(
-            f"Status: READY — {len(puts)} put(s) across {len(dests)} destination(s) [{mode}]"
+            f"Status: READY — {len(puts)} put(s), {len(deletes)} delete(s) "
+            f"across {len(dests)} destination(s) [{mode}]"
         )
+        self.query_one("#prune-warning", Static).display = bool(deletes)
         log = self.query_one("#confirm-destinations", RichLog)
         log.clear()
         for dest in dests:
-            count = sum(1 for p in puts if p.target.destination_id == dest)
-            connector = next(p.target.connector_id for p in puts if p.target.destination_id == dest)
-            log.write(f"{dest} ({connector}): {count} put(s)")
+            put_count = sum(1 for p in puts if p.target.destination_id == dest)
+            del_count = sum(1 for d in deletes if d.target.destination_id == dest)
+            connector = next(
+                (p.target.connector_id for p in puts if p.target.destination_id == dest),
+                None,
+            )
+            if connector is None:
+                connector = next(
+                    d.target.connector_id for d in deletes if d.target.destination_id == dest
+                )
+            log.write(f"{dest} ({connector}): {put_count} put(s), {del_count} delete(s)")
 
     def action_go_back(self) -> None:
         self.app.pop_screen()
@@ -325,6 +389,7 @@ class ExecutionScreen(Screen[None]):
                 max_concurrency=app.max_concurrency,
                 on_destination_progress=on_progress,
                 mutation_ids=app.retry_mutation_ids,
+                prune=app.prune,
             )
         except Exception:  # noqa: BLE001 — map unexpected cancel/errors to interrupted report
             report = ApplyReport(
