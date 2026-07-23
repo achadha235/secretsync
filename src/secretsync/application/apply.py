@@ -93,6 +93,8 @@ def run_apply(
     confirm_fn: ConfirmFn | None = None,
     on_destination_progress: ProgressFn | None = None,
     mutation_ids: frozenset[str] | None = None,
+    deployments: set[str] | None = None,
+    destinations: set[str] | None = None,
 ) -> ApplyReport:
     """Synchronous entry used by Click; runs the async coordinator."""
 
@@ -105,6 +107,8 @@ def run_apply(
             confirm_fn=confirm_fn,
             on_destination_progress=on_destination_progress,
             mutation_ids=mutation_ids,
+            deployments=deployments,
+            destinations=destinations,
         )
 
     return anyio.run(_runner)
@@ -119,10 +123,19 @@ async def run_apply_async(
     confirm_fn: ConfirmFn | None = None,
     on_destination_progress: ProgressFn | None = None,
     mutation_ids: frozenset[str] | None = None,
+    deployments: set[str] | None = None,
+    destinations: set[str] | None = None,
 ) -> ApplyReport:
     """Async apply entry used by the Textual TUI workers."""
+    from loguru import logger
+
     started = services.clock.now()
-    validation = validate_config(services, config_path)
+    validation = validate_config(
+        services,
+        config_path,
+        deployments=deployments,
+        destinations=destinations,
+    )
     if not validation.ok or validation.config is None:
         issue = validation.issues[0] if validation.issues else None
         return ApplyReport(
@@ -139,8 +152,13 @@ async def run_apply_async(
         )
 
     config = validation.config
+    selected_dest_ids = {
+        d.destination for d in config.deployments if d.name in set(validation.selected_deployments)
+    }
     try:
-        connector_issues = await _static_validate_connectors(services, config)
+        connector_issues = await _static_validate_connectors(
+            services, config, destination_ids=selected_dest_ids or None
+        )
     except SecretSyncError as exc:
         return ApplyReport(
             exit_code=exit_code_for(exc),
@@ -161,7 +179,13 @@ async def run_apply_async(
             ),
         )
 
-    plan = build_plan(config, validation.composed_sets)
+    plan = build_plan(
+        config,
+        validation.composed_sets,
+        deployments=deployments,
+        destinations=destinations,
+    )
+    logger.info("Apply plan has {} put(s)", len(plan.puts))
     if mutation_ids is not None:
         filtered = tuple(put for put in plan.puts if put.mutation_id in mutation_ids)
         plan = Plan(strategy=plan.strategy, puts=filtered)
@@ -232,10 +256,15 @@ def _default_confirm(prompt: str) -> bool:
 
 
 async def _static_validate_connectors(
-    services: AppServices, config: RootConfig
+    services: AppServices,
+    config: RootConfig,
+    *,
+    destination_ids: set[str] | None = None,
 ) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
     for dest_id, destination in config.destinations.items():
+        if destination_ids is not None and dest_id not in destination_ids:
+            continue
         if not services.connectors.is_registered(destination.connector):
             if services.connectors.is_known(destination.connector):
                 raise ConnectorNotImplementedError(destination.connector)

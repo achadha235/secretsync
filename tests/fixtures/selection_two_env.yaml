@@ -1,0 +1,29 @@
+version: 1
+changeDetection: always-write
+secrets:
+  prodOnly:
+    env: PROD_ONLY_SECRET
+  stagingOnly:
+    env: STAGING_ONLY_SECRET
+sets:
+  production:
+    include: [prodOnly]
+  staging:
+    include: [stagingOnly]
+destinations:
+  sink:
+    connector: fake-batch
+    label: sink
+deployments:
+  - name: prod-deploy
+    set: production
+    destination: sink
+    scope: {stage: production}
+    secrets:
+      prodOnly: PROD_SECRET
+  - name: staging-deploy
+    set: staging
+    destination: sink
+    scope: {stage: staging}
+    secrets:
+      stagingOnly: STAGING_SECRET

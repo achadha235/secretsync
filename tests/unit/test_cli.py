@@ -67,12 +67,12 @@ def test_plan_cli_json() -> None:
         env=FULL_ENV,
     )
     assert result.exit_code == 0
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert payload["schemaVersion"] == 1
     assert payload["strategy"] == "always-write"
     assert payload["summary"]["puts"] == 7
     for value in ("postgres://prod", "sk_test", "ghp_test"):
-        assert value not in result.output
+        assert value not in result.stdout
 
 
 def test_apply_cli_with_fakes() -> None:
@@ -90,11 +90,11 @@ def test_apply_cli_with_fakes() -> None:
         env=FAKE_ENV,
     )
     assert result.exit_code == 0
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert payload["summary"]["applied"] == 4
     assert payload["summary"]["failed"] == 0
     for value in FAKE_ENV.values():
-        assert value not in result.output
+        assert value not in result.stdout
 
 
 def test_ui_json_format_rejected() -> None:
