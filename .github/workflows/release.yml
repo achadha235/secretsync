@@ -4,13 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       bump:
-        description: Semver component to bump
+        description: Semver component to bump (none = publish current version as-is)
         required: true
         type: choice
         options:
           - patch
           - minor
           - major
+          - none
         default: patch
 
 concurrency:
@@ -50,10 +51,12 @@ jobs:
           uv run mypy src
           uv run pytest --cov=secretsync --cov-fail-under=80 -q
 
-      - name: Bump version
+      - name: Resolve version
         id: version
         run: |
-          uv version --bump "${{ inputs.bump }}"
+          if [ "${{ inputs.bump }}" != "none" ]; then
+            uv version --bump "${{ inputs.bump }}"
+          fi
           VERSION="$(uv version --short)"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
@@ -62,10 +65,12 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add pyproject.toml uv.lock
-          git commit -m "release: ${{ steps.version.outputs.tag }}"
+          if [ "${{ inputs.bump }}" != "none" ]; then
+            git add pyproject.toml uv.lock
+            git commit -m "release: ${{ steps.version.outputs.tag }}"
+            git push origin HEAD
+          fi
           git tag -a "${{ steps.version.outputs.tag }}" -m "Release ${{ steps.version.outputs.tag }}"
-          git push origin HEAD
           git push origin "${{ steps.version.outputs.tag }}"
 
       - name: Build artifacts
