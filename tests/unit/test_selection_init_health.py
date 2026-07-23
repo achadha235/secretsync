@@ -29,7 +29,7 @@ def test_cli_init_and_second_fails(tmp_path, monkeypatch) -> None:
     first = runner.invoke(cli, ["init"])
     assert first.exit_code == 0
     assert (tmp_path / "secretsync.yaml").is_file()
-    assert (tmp_path / ".env.secretsync.tpl").is_file()
+    assert (tmp_path / ".env.tpl").is_file()
     assert (tmp_path / ".secretsync" / "audit.log").is_file()
     second = runner.invoke(cli, ["init"])
     assert second.exit_code == 2

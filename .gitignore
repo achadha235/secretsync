@@ -19,9 +19,14 @@ htmlcov/
 .env
 .env.*
 !.env.example
+!.env.tpl
+.secretsync/
+
+# Node / SST example artifacts (also ignored under examples/)
+node_modules/
+.sst/
 
 # Agent / local tooling
 .testagent/
 secretsync-apply-report.json
-.secretsync/
 .vercel

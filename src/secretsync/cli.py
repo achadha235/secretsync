@@ -12,7 +12,11 @@ import click
 from loguru import logger
 
 from secretsync.application.apply import run_apply
-from secretsync.application.health import HealthReport, health_token_envs_from_config, run_health
+from secretsync.application.health import (
+    HealthReport,
+    health_token_envs_from_config,
+    run_health,
+)
 from secretsync.application.plan import plan_from_path
 from secretsync.application.selection import selection_extra
 from secretsync.application.services import AppServices, create_services
@@ -49,7 +53,9 @@ def _configure_logging(*, verbose: bool, quiet: bool) -> None:
         level = "DEBUG"
     else:
         level = "INFO"
-    logger.add(sys.stderr, level=level, format="{time:HH:mm:ss} | {level:<7} | {message}")
+    logger.add(
+        sys.stderr, level=level, format="{time:HH:mm:ss} | {level:<7} | {message}"
+    )
 
 
 def _dep_set(ctx: AppContext) -> set[str] | None:
@@ -117,12 +123,12 @@ def cli(
 @cli.command("init")
 @click.pass_obj
 def init_cmd(ctx: AppContext) -> None:
-    """Create secretsync.yaml and .env.secretsync.tpl in the current directory."""
+    """Create secretsync.yaml and .env.tpl in the current directory."""
     from secretsync.init_templates import ENV_SECRETSYNC_TPL, SECRETSYNC_YAML
 
     cwd = Path.cwd()
     yaml_path = cwd / "secretsync.yaml"
-    tpl_path = cwd / ".env.secretsync.tpl"
+    tpl_path = cwd / ".env.tpl"
     if yaml_path.exists():
         click.echo(
             f"Refusing to overwrite existing {yaml_path.name}. "
@@ -229,7 +235,9 @@ def plan_cmd(ctx: AppContext, prune: bool) -> None:
 
 @cli.command("apply")
 @click.option("--yes", is_flag=True, help="Skip interactive confirmation.")
-@click.option("--max-concurrency", type=click.IntRange(1, 32), default=4, show_default=True)
+@click.option(
+    "--max-concurrency", type=click.IntRange(1, 32), default=4, show_default=True
+)
 @click.option(
     "--prune",
     is_flag=True,
@@ -269,7 +277,9 @@ def apply_cmd(ctx: AppContext, yes: bool, max_concurrency: int, prune: bool) -> 
 @click.pass_obj
 def health_cmd(ctx: AppContext) -> None:
     """Check connector auth / reachability for env vars that are set."""
-    github_env, vercel_env = health_token_envs_from_config(ctx.config_path, ctx.services.environ)
+    github_env, vercel_env = health_token_envs_from_config(
+        ctx.config_path, ctx.services.environ
+    )
 
     async def _run() -> HealthReport:
         return await run_health(

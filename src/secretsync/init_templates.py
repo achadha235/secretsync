@@ -81,17 +81,17 @@ deployments:
 
 ENV_SECRETSYNC_TPL = """\
 # Connector auth (inject via `op run --env-file=.env.secretsync` or your vault)
-GITHUB_TOKEN=op://vault/github/token
-VERCEL_TOKEN=op://vault/vercel/token
+GITHUB_TOKEN="op://vault/github/token"
+VERCEL_TOKEN="op://vault/vercel/token"
 # Prefer a named profile for SST/AWS:
-AWS_PROFILE=default
-AWS_REGION=us-east-1
+AWS_PROFILE="default"
+AWS_REGION="us-east-1"
 # Or explicit keys instead of AWS_PROFILE:
 # AWS_ACCESS_KEY_ID=op://vault/aws/access-key-id
 # AWS_SECRET_ACCESS_KEY=op://vault/aws/secret-access-key
 
 # App secrets referenced by secretsync.yaml
-SECRET_ONE_PROD=op://vault/app/secret-one-prod
-SECRET_ONE_STAGING=op://vault/app/secret-one-staging
-SECRET_TWO_COMMON=op://vault/app/secret-two-common
+# SECRET_ONE_PROD="op://vault/app/secret-one-prod"
+# SECRET_ONE_STAGING="op://vault/app/secret-one-staging"
+# SECRET_TWO_COMMON="op://vault/app/secret-two-common"
 """
