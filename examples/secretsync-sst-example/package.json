@@ -1,0 +1,20 @@
+{
+  "name": "secretsync-sst-example",
+  "description": "An example SST project for the secretsync package",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "devDependencies": {
+    "@types/aws-lambda": "8.10.162",
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "sst": "4.17.1"
+  },
+  "scripts": {
+    "dev": "sst dev"
+  }
+}
