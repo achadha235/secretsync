@@ -148,10 +148,7 @@ class RootConfig(StrictModel):
         overlap = sorted(set(self.secrets) & set(self.variables))
         if overlap:
             listed = ", ".join(repr(i) for i in overlap)
-            msg = (
-                f"Logical ids must be unique across secrets and variables; "
-                f"overlap: {listed}"
-            )
+            msg = f"Logical ids must be unique across secrets and variables; overlap: {listed}"
             raise ValueError(msg)
         if not self.destinations:
             msg = "destinations must declare at least one destination"
