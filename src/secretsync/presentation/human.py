@@ -41,7 +41,7 @@ def render_plan_human(plan: Plan) -> str:
             lines.append(f"Deployment: {put.deployment_id}")
         scope = dict(put.target.scope)
         lines.append(
-            f"  - put {put.mutation_id}: {put.source.logical_id} "
+            f"  - put {put.mutation_id} ({put.source.kind.value}): {put.source.logical_id} "
             f"-> {put.target.destination_id}/{put.target.name} "
             f"[{put.target.connector_id}] scope={scope}"
         )
@@ -51,7 +51,7 @@ def render_plan_human(plan: Plan) -> str:
         for deletion in plan.deletes:
             scope = dict(deletion.target.scope)
             lines.append(
-                f"  - delete {deletion.mutation_id}: "
+                f"  - delete {deletion.mutation_id} ({deletion.kind.value}): "
                 f"{deletion.target.destination_id}/{deletion.target.name} "
                 f"[{deletion.target.connector_id}] scope={scope}"
             )

@@ -44,6 +44,7 @@ def plan_to_dict(plan: Plan) -> dict[str, Any]:
                 "deployment": put.deployment_id,
                 "logicalId": put.source.logical_id,
                 "sourceEnv": put.source.env_name,
+                "kind": put.source.kind.value,
                 "name": put.target.name,
                 "scopes": [dict(put.target.scope)],
                 "operation": "put",
@@ -64,6 +65,7 @@ def plan_to_dict(plan: Plan) -> dict[str, Any]:
             {
                 "mutationId": deletion.mutation_id,
                 "deployment": deletion.deployment_id,
+                "kind": deletion.kind.value,
                 "name": deletion.target.name,
                 "scopes": [dict(deletion.target.scope)],
                 "operation": "delete",

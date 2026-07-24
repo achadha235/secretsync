@@ -94,8 +94,9 @@ def test_plan_human_and_json_group_by_deployment() -> None:
     assert "SecretSync plan (always-write)" in human
     assert "Deployment: prod" in human
     assert "Deployment: staging" in human
-    assert "m1:" in human and "m3:" in human
-    assert "put m1:" in human
+    assert "m1" in human and "m3" in human
+    assert "put m1 (secret):" in human
+    assert "put m3 (secret):" in human
     assert CANARY not in human
     assert CANARY not in render_plan_json(plan)
 

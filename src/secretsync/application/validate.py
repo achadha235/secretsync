@@ -21,6 +21,7 @@ from secretsync.domain.errors import (
     UnimplementedChangeDetectionError,
     exit_code_for,
 )
+from secretsync.domain.models import ValueKind
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,7 +84,7 @@ def validate_loaded(
             len(selected),
             ", ".join(d.name for d in selected),
         )
-        _validate_deployments(config, composed, services.connectors, selected)
+        _validate_deployments(config, composed, services.connectors, services, selected)
         _check_environment_presence(config, composed, services.environ, selected)
         return ValidationResult(
             config=config,
@@ -107,9 +108,10 @@ def _validate_deployments(
     config: RootConfig,
     composed: dict[str, ComposedSet],
     connectors: ConnectorRegistry,
+    services: AppServices,
     selected: Sequence[DeploymentDefinition],
 ) -> None:
-    seen_targets: set[tuple[str, str, str]] = set()
+    seen_targets: set[tuple[str, str, str, str]] = set()
 
     for deployment in selected:
         if deployment.set not in composed:
@@ -130,17 +132,87 @@ def _validate_deployments(
                 f"'{destination.connector}'"
             )
 
+        if destination.connector == "vercel" and "sensitive" in deployment.scope:
+            raise ConfigInvalidError(
+                f"Deployment '{deployment.name}' uses deprecated scope.sensitive on Vercel",
+                hint=(
+                    "Remove scope.sensitive. Put sensitive values under deployment.secrets "
+                    "and plaintext under deployment.variables; the vercel connector sets "
+                    "type from kind."
+                ),
+            )
+
         available = composed[deployment.set]
+        kinds_used: set[ValueKind] = set()
+
         for logical_id, dest_name in deployment.secrets.items():
-            available.require(logical_id)
-            scope_key = _scope_identity(deployment.scope)
-            identity = (deployment.destination, scope_key, dest_name)
-            if identity in seen_targets:
+            ref = available.require(logical_id)
+            if ref.kind is not ValueKind.SECRET:
                 raise ConfigInvalidError(
-                    f"Duplicate target identity for secret '{dest_name}' on destination "
-                    f"'{deployment.destination}' with scope {deployment.scope!r}"
+                    f"Deployment '{deployment.name}' maps '{logical_id}' under secrets, "
+                    f"but it is declared under variables",
+                    hint=(
+                        f"Move '{logical_id}: {dest_name}' to deployment.variables, "
+                        f"or redefine '{logical_id}' under top-level secrets."
+                    ),
                 )
-            seen_targets.add(identity)
+            kinds_used.add(ValueKind.SECRET)
+            _record_target(
+                seen_targets,
+                deployment,
+                dest_name,
+                ValueKind.SECRET,
+            )
+
+        for logical_id, dest_name in deployment.variables.items():
+            ref = available.require(logical_id)
+            if ref.kind is not ValueKind.VARIABLE:
+                raise ConfigInvalidError(
+                    f"Deployment '{deployment.name}' maps '{logical_id}' under variables, "
+                    f"but it is declared under secrets",
+                    hint=(
+                        f"Move '{logical_id}: {dest_name}' to deployment.secrets, "
+                        f"or redefine '{logical_id}' under top-level variables if it is "
+                        f"not sensitive."
+                    ),
+                )
+            kinds_used.add(ValueKind.VARIABLE)
+            _record_target(
+                seen_targets,
+                deployment,
+                dest_name,
+                ValueKind.VARIABLE,
+            )
+
+        if connectors.is_registered(destination.connector):
+            instance = connectors.create(destination.connector, services)
+            for kind in sorted(kinds_used, key=lambda k: k.value):
+                issue = instance.check_kind_support(kind)
+                if issue is not None:
+                    raise ConfigInvalidError(
+                        (
+                            f"Deployment '{deployment.name}' on destination "
+                            f"'{deployment.destination}' [{destination.connector}]: "
+                            f"{issue.message}"
+                        ),
+                        hint=issue.hint,
+                    )
+
+
+def _record_target(
+    seen_targets: set[tuple[str, str, str, str]],
+    deployment: DeploymentDefinition,
+    dest_name: str,
+    kind: ValueKind,
+) -> None:
+    scope_key = _scope_identity(deployment.scope)
+    identity = (deployment.destination, scope_key, kind.value, dest_name)
+    if identity in seen_targets:
+        raise ConfigInvalidError(
+            f"Duplicate target identity for {kind.value} '{dest_name}' on destination "
+            f"'{deployment.destination}' with scope {deployment.scope!r}"
+        )
+    seen_targets.add(identity)
 
 
 def _scope_identity(scope: Mapping[str, object]) -> str:
@@ -159,7 +231,7 @@ def _check_environment_presence(
 
     for deployment in selected:
         available = composed[deployment.set]
-        for logical_id in deployment.secrets:
+        for logical_id in (*deployment.secrets, *deployment.variables):
             ref = available.require(logical_id)
             required_source.add(ref.env_name)
 

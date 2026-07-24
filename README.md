@@ -40,12 +40,17 @@ secrets:
   apiKey:
     env: API_KEY # reads os.environ["API_KEY"]
 
-# Named bundles of secrets to ship together
+# Non-secret configuration (same shape; never written to a secure store as a secret)
+variables:
+  logLevel:
+    env: LOG_LEVEL
+
+# Named bundles of secrets/variables to ship together
 sets:
   production:
-    include: [apiKey]
+    include: [apiKey, logLevel]
 
-# Where secrets can be written (connector + auth)
+# Where values can be written (connector + auth)
 destinations:
   github:
     connector: github-actions
@@ -64,7 +69,14 @@ deployments:
     secrets:
       # logical id → remote secret name in GitHub Actions
       apiKey: API_KEY
+    variables:
+      # logical id → remote variable name (Actions Variables API)
+      logLevel: LOG_LEVEL
 ```
+
+Kind is declared once under `secrets` or `variables`. Connectors map kind to the provider primitive (GitHub secrets vs variables APIs; Vercel `type: sensitive` vs `encrypted`). SST supports secrets only — non-secret SST config belongs in code as [Linkables](https://sst.dev/docs/component/linkable/).
+
+> **Breaking:** Vercel `scope.sensitive` is removed. Put sensitive values under `deployment.secrets` and plaintext under `deployment.variables`.
 
 ## Deploy secrets
 
@@ -111,7 +123,7 @@ op run --env-file=.env.tpl -- secretsync --destination github plan
 
 Useful flags: `--config`, `--format json`, `--verbose`, `--quiet`, `--deployment`, `--destination`, `--prune`.
 
-With `--prune`, SecretSync lists remote secret names at plan time and treats YAML as the full desired inventory for each destination scope — remote secrets not listed in the config are planned for deletion (including secrets never created by SecretSync). Without `--prune`, apply is put-only.
+With `--prune`, SecretSync lists remote names at plan time (secrets and variables separately) and treats YAML as the full desired inventory for each destination scope + kind — remote entries not listed in the config are planned for deletion. Without `--prune`, apply is put-only.
 
 ## Supported Destinations
 

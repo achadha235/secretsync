@@ -1,0 +1,23 @@
+version: 1
+changeDetection: always-write
+secrets:
+  apiKey:
+    env: API_KEY
+sets:
+  production:
+    include: [apiKey]
+destinations:
+  vercel:
+    connector: vercel
+    project: web
+    auth:
+      tokenEnv: VERCEL_TOKEN
+deployments:
+  - name: vercel-production
+    set: production
+    destination: vercel
+    scope:
+      targets: [production]
+      sensitive: true
+    secrets:
+      apiKey: API_KEY

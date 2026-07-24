@@ -76,3 +76,14 @@ deployments:
         raise AssertionError("expected ConfigInvalidError")
     except ConfigInvalidError as exc:
         assert exc.code == "CONFIG_INVALID"
+
+
+def test_compose_mixed_secrets_and_variables() -> None:
+    from secretsync.domain.models import ValueKind
+
+    config = ConfigLoader().load(fixture_path("variables_mixed.yaml"))
+    composed = compose_from_config(config)
+    production = composed["production"]
+    assert production.require("apiKey").kind is ValueKind.SECRET
+    assert production.require("logLevel").kind is ValueKind.VARIABLE
+    assert production.require("logLevel").env_name == "LOG_LEVEL"

@@ -82,12 +82,21 @@ class DestinationDefinition(StrictModel):
         return data
 
 
+def _validate_publish_map(value: dict[str, str], field_name: str) -> dict[str, str]:
+    for logical_id, dest_name in value.items():
+        if not logical_id or not dest_name:
+            msg = f"{field_name} keys and values must be non-empty"
+            raise ValueError(msg)
+    return value
+
+
 class DeploymentDefinition(StrictModel):
     name: str
     set: str
     destination: str
     scope: dict[str, Any]
-    secrets: dict[str, str]
+    secrets: dict[str, str] = Field(default_factory=dict)
+    variables: dict[str, str] = Field(default_factory=dict)
 
     @field_validator("name")
     @classmethod
@@ -99,15 +108,20 @@ class DeploymentDefinition(StrictModel):
 
     @field_validator("secrets")
     @classmethod
-    def secrets_non_empty_map(cls, value: dict[str, str]) -> dict[str, str]:
-        if not value:
-            msg = "deployment.secrets must declare at least one mapping"
+    def secrets_map_valid(cls, value: dict[str, str]) -> dict[str, str]:
+        return _validate_publish_map(value, "deployment.secrets")
+
+    @field_validator("variables")
+    @classmethod
+    def variables_map_valid(cls, value: dict[str, str]) -> dict[str, str]:
+        return _validate_publish_map(value, "deployment.variables")
+
+    @model_validator(mode="after")
+    def at_least_one_publish_map(self) -> DeploymentDefinition:
+        if not self.secrets and not self.variables:
+            msg = "deployment must declare secrets and/or variables mappings"
             raise ValueError(msg)
-        for logical_id, dest_name in value.items():
-            if not logical_id or not dest_name:
-                msg = "deployment.secrets keys and values must be non-empty"
-                raise ValueError(msg)
-        return value
+        return self
 
 
 class RootConfig(StrictModel):
@@ -116,7 +130,8 @@ class RootConfig(StrictModel):
         default="always-write",
         alias="changeDetection",
     )
-    secrets: dict[str, SecretDefinition]
+    secrets: dict[str, SecretDefinition] = Field(default_factory=dict)
+    variables: dict[str, SecretDefinition] = Field(default_factory=dict)
     sets: dict[str, SetDefinition] = Field(default_factory=dict)
     destinations: dict[str, DestinationDefinition]
     deployments: list[DeploymentDefinition]
@@ -127,8 +142,16 @@ class RootConfig(StrictModel):
         if len(names) != len(set(names)):
             msg = "deployment names must be unique"
             raise ValueError(msg)
-        if not self.secrets:
-            msg = "secrets must declare at least one logical secret"
+        if not self.secrets and not self.variables:
+            msg = "secrets and/or variables must declare at least one logical id"
+            raise ValueError(msg)
+        overlap = sorted(set(self.secrets) & set(self.variables))
+        if overlap:
+            listed = ", ".join(repr(i) for i in overlap)
+            msg = (
+                f"Logical ids must be unique across secrets and variables; "
+                f"overlap: {listed}"
+            )
             raise ValueError(msg)
         if not self.destinations:
             msg = "destinations must declare at least one destination"

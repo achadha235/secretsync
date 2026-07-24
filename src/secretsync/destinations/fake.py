@@ -21,7 +21,7 @@ from secretsync.destinations.base import (
     PutSemantics,
     SafeConnectorError,
 )
-from secretsync.domain.models import JsonValue
+from secretsync.domain.models import JsonValue, ValueKind
 
 
 def _individual_capabilities() -> DestinationCapabilities:
@@ -85,13 +85,19 @@ class FakeDestination:
         del config
         return []
 
+    def check_kind_support(self, kind: ValueKind) -> Issue | None:
+        del kind
+        return None
+
     async def list_names(
         self,
         config: Mapping[str, JsonValue],
         scope: Mapping[str, JsonValue],
         context: OperationContext,
+        *,
+        kind: ValueKind = ValueKind.SECRET,
     ) -> frozenset[str]:
-        del config
+        del config, kind
         if not self.manifest.capabilities.list_names:
             raise ListNamesError(
                 SafeConnectorError(

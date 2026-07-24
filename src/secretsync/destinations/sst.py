@@ -24,7 +24,7 @@ from secretsync.destinations.base import (
     PutSemantics,
     SafeConnectorError,
 )
-from secretsync.domain.models import JsonValue
+from secretsync.domain.models import JsonValue, ValueKind
 from secretsync.infrastructure.process import (
     ENV_FILE_PLACEHOLDER,
     AsyncSecureProcessRunner,
@@ -118,11 +118,30 @@ class SstDestination:
             )
         return issues
 
+    def check_kind_support(self, kind: ValueKind) -> Issue | None:
+        if kind is ValueKind.SECRET:
+            return None
+        return Issue(
+            code="CONFIG_INVALID",
+            message=(
+                "SST has no SecretSync-managed variables surface. Non-secret configuration "
+                "is declared in code as Linkables (or other linked resource properties) and "
+                "is managed by SST/Pulumi — it is not pushed through SecretSync like secrets."
+            ),
+            hint=(
+                "Remove variables: from this SST deployment and keep only secrets:. "
+                "Declare plaintext config with sst.Linkable in sst.config.ts — "
+                "see https://sst.dev/docs/component/linkable/."
+            ),
+        )
+
     async def list_names(
         self,
         config: Mapping[str, JsonValue],
         scope: Mapping[str, JsonValue],
         context: OperationContext,
+        *,
+        kind: ValueKind = ValueKind.SECRET,
     ) -> frozenset[str]:
         wd = _working_directory(config)
         if wd is None:
@@ -130,6 +149,17 @@ class SstDestination:
                 SafeConnectorError(
                     code="DESTINATION_INVALID",
                     message="Invalid sst destination configuration",
+                    correlation_id=context.correlation_id,
+                )
+            )
+        if kind is not ValueKind.SECRET:
+            issue = self.check_kind_support(kind)
+            assert issue is not None
+            raise ListNamesError(
+                SafeConnectorError(
+                    code=issue.code,
+                    message=issue.message,
+                    hint=issue.hint,
                     correlation_id=context.correlation_id,
                 )
             )

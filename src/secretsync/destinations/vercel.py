@@ -22,7 +22,7 @@ from secretsync.destinations.base import (
     PutSemantics,
     SafeConnectorError,
 )
-from secretsync.domain.models import JsonValue
+from secretsync.domain.models import JsonValue, ValueKind
 from secretsync.infrastructure.http import HttpRequestError, error_for_status, request_with_retries
 
 VERCEL_API = "https://api.vercel.com"
@@ -68,15 +68,23 @@ def _team_id(config: Mapping[str, JsonValue]) -> str | None:
     return team if isinstance(team, str) and team else None
 
 
-def _validate_scope(scope: Mapping[str, JsonValue]) -> str | None:
+def _validate_scope(
+    scope: Mapping[str, JsonValue],
+    *,
+    kind: ValueKind = ValueKind.SECRET,
+) -> str | None:
     targets = scope.get("targets")
     if not isinstance(targets, list) or not targets or not all(isinstance(t, str) for t in targets):
         return "scope.targets must be a non-empty string array"
-    sensitive = bool(scope.get("sensitive", False))
-    if sensitive:
+    if "sensitive" in scope:
+        return (
+            "scope.sensitive is no longer supported; remove it and use deployment.secrets "
+            "vs deployment.variables so the connector sets type from kind"
+        )
+    if kind is ValueKind.SECRET:
         illegal = [t for t in targets if t not in SENSITIVE_TARGETS]
         if illegal:
-            return "sensitive variables are limited to production and preview targets"
+            return "sensitive (secret) variables are limited to production and preview targets"
     git_branch = scope.get("gitBranch")
     if git_branch is not None:
         if not isinstance(git_branch, str):
@@ -86,13 +94,18 @@ def _validate_scope(scope: Mapping[str, JsonValue]) -> str | None:
     return None
 
 
-def _env_type(scope: Mapping[str, JsonValue]) -> str:
-    if bool(scope.get("sensitive", False)):
+def _env_type(kind: ValueKind) -> str:
+    if kind is ValueKind.SECRET:
         return "sensitive"
     return "encrypted"
 
 
-def _env_matches_scope(item: Mapping[str, Any], scope: Mapping[str, JsonValue]) -> bool:
+def _env_matches_scope(
+    item: Mapping[str, Any],
+    scope: Mapping[str, JsonValue],
+    *,
+    kind: ValueKind = ValueKind.SECRET,
+) -> bool:
     """True when a remote env entry belongs to the deployment inventory unit."""
     targets_raw = scope.get("targets")
     if not isinstance(targets_raw, list):
@@ -107,8 +120,14 @@ def _env_matches_scope(item: Mapping[str, Any], scope: Mapping[str, JsonValue]) 
     scope_branch = scope.get("gitBranch")
     item_branch = item.get("gitBranch")
     if scope_branch is None:
-        return item_branch is None
-    return item_branch == scope_branch
+        if item_branch is not None:
+            return False
+    elif item_branch != scope_branch:
+        return False
+    remote_type = str(item.get("type", ""))
+    if kind is ValueKind.SECRET:
+        return remote_type == "sensitive"
+    return remote_type != "sensitive"
 
 
 def _parse_env_list(payload: Any) -> list[dict[str, Any]]:
@@ -135,11 +154,17 @@ class VercelDestination:
             issues.append(Issue(code="AUTH_MISSING", message="vercel requires auth.tokenEnv"))
         return issues
 
+    def check_kind_support(self, kind: ValueKind) -> Issue | None:
+        del kind
+        return None
+
     async def list_names(
         self,
         config: Mapping[str, JsonValue],
         scope: Mapping[str, JsonValue],
         context: OperationContext,
+        *,
+        kind: ValueKind = ValueKind.SECRET,
     ) -> frozenset[str]:
         project = _project(config)
         token_env = _token_env(config)
@@ -151,7 +176,7 @@ class VercelDestination:
                     correlation_id=context.correlation_id,
                 )
             )
-        reason = _validate_scope(dict(scope))
+        reason = _validate_scope(dict(scope), kind=kind)
         if reason:
             raise ListNamesError(
                 SafeConnectorError(
@@ -182,7 +207,9 @@ class VercelDestination:
         except ListNamesError:
             raise
         names = {
-            str(item["key"]) for item in envs if "key" in item and _env_matches_scope(item, scope)
+            str(item["key"])
+            for item in envs
+            if "key" in item and _env_matches_scope(item, scope, kind=kind)
         }
         return frozenset(names)
 
@@ -222,7 +249,7 @@ class VercelDestination:
                     correlation_id=context.correlation_id,
                 )
                 return _all_failed_ops(all_ops, error)
-            reason = _validate_scope(dict(mutation.scopes[0]))
+            reason = _validate_scope(dict(mutation.scopes[0]), kind=mutation.kind)
             if reason:
                 error = SafeConnectorError(
                     code="DESTINATION_INVALID",
@@ -240,7 +267,7 @@ class VercelDestination:
                     correlation_id=context.correlation_id,
                 )
                 return _all_failed_ops(all_ops, error)
-            reason = _validate_scope(dict(deletion.scopes[0]))
+            reason = _validate_scope(dict(deletion.scopes[0]), kind=deletion.kind)
             if reason:
                 error = SafeConnectorError(
                     code="DESTINATION_INVALID",
@@ -302,7 +329,7 @@ class VercelDestination:
             entry: dict[str, Any] = {
                 "key": mutation.name,
                 "value": bytes(mutation.value).decode("utf-8"),
-                "type": _env_type(scope),
+                "type": _env_type(mutation.kind),
                 "target": [str(t) for t in targets_raw],
             }
             if scope.get("gitBranch"):
@@ -451,7 +478,9 @@ class VercelDestination:
             scope = dict(deletion.scopes[0])
             env_id: str | None = None
             for item in envs:
-                if item.get("key") == deletion.name and _env_matches_scope(item, scope):
+                if item.get("key") == deletion.name and _env_matches_scope(
+                    item, scope, kind=deletion.kind
+                ):
                     env_id = str(item.get("id", "")) or None
                     break
             if env_id is None:
@@ -545,13 +574,24 @@ class VercelDestination:
 
         by_key: dict[str, str] = {}
         for item in envs:
-            if "key" in item and "id" in item:
-                by_key[str(item["key"])] = str(item["id"])
+            if "key" not in item or "id" not in item:
+                continue
+            # Prefer matching inventory kind when the same key exists twice.
+            by_key[str(item["key"])] = str(item["id"])
 
         results: dict[str, MutationResult] = {}
         requests = list_requests
         for mutation in mutations:
-            env_id = by_key.get(mutation.name)
+            scope = dict(mutation.scopes[0])
+            env_id: str | None = None
+            for item in envs:
+                if item.get("key") != mutation.name:
+                    continue
+                if _env_matches_scope(item, scope, kind=mutation.kind):
+                    env_id = str(item.get("id", "")) or None
+                    break
+            if env_id is None:
+                env_id = by_key.get(mutation.name)
             if env_id is None:
                 results[mutation.mutation_id] = MutationResult(
                     mutation_id=mutation.mutation_id,
@@ -564,7 +604,6 @@ class VercelDestination:
                     ),
                 )
                 continue
-            scope = dict(mutation.scopes[0])
             edit_url = (
                 f"{VERCEL_API}/v9/projects/{quote(project, safe='')}/env/{quote(env_id, safe='')}"
             )
@@ -572,7 +611,7 @@ class VercelDestination:
             assert isinstance(targets_raw, list)
             body = {
                 "value": bytes(mutation.value).decode("utf-8"),
-                "type": _env_type(scope),
+                "type": _env_type(mutation.kind),
                 "target": [str(t) for t in targets_raw],
             }
             edit_params: dict[str, str] = {}

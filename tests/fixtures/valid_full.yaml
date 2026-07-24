@@ -50,7 +50,6 @@ deployments:
     destination: vercel
     scope:
       targets: [production]
-      sensitive: true
     secrets:
       databaseUrl: POSTGRES_URL
       stripeSecretKey: STRIPE_SECRET_KEY

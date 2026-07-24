@@ -441,6 +441,7 @@ async def _apply_destination(
                 mutation_id=d.mutation_id,
                 name=d.target.name,
                 scopes=(dict(d.target.scope),),
+                kind=d.kind,
             )
             for d in deployment_deletes
         ]
@@ -453,6 +454,7 @@ async def _apply_destination(
                         name=put.target.name,
                         value=material.value,
                         scopes=(dict(put.target.scope),),
+                        kind=put.source.kind,
                     )
                 )
             context = OperationContext(correlation_id=str(uuid.uuid4()))
