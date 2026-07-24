@@ -21,7 +21,14 @@ from secretsync.domain.errors import (
     UnimplementedChangeDetectionError,
     exit_code_for,
 )
-from secretsync.domain.models import JsonValue, Plan, PlannedDelete, PlannedPut, TargetRef
+from secretsync.domain.models import (
+    JsonValue,
+    Plan,
+    PlannedDelete,
+    PlannedPut,
+    TargetRef,
+    ValueKind,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +37,7 @@ class _InventoryUnit:
     connector_id: str
     scope: Mapping[str, JsonValue]
     scope_key: str
+    kind: ValueKind
     deployment_ids: tuple[str, ...]
     intended_names: frozenset[str]
 
@@ -52,6 +60,16 @@ def build_plan(
     for deployment in selected:
         available = composed_sets[deployment.set]
         for logical_id, destination_name in deployment.secrets.items():
+            source = available.require(logical_id)
+            puts.append(
+                PlannedPut(
+                    mutation_id=stable_mutation_id(deployment.name, destination_name),
+                    deployment_id=deployment.name,
+                    source=source,
+                    target=compile_target(config, deployment, destination_name),
+                )
+            )
+        for logical_id, destination_name in deployment.variables.items():
             source = available.require(logical_id)
             puts.append(
                 PlannedPut(
@@ -108,7 +126,12 @@ async def build_plan_async(
         dest_config = _destination_config_map(destination)
         context = OperationContext(correlation_id=str(uuid.uuid4()))
         try:
-            remote = await instance.list_names(dest_config, dict(unit.scope), context)
+            remote = await instance.list_names(
+                dest_config,
+                dict(unit.scope),
+                context,
+                kind=unit.kind,
+            )
         except ListNamesError as exc:
             raise SecretSyncError(
                 SafeError(
@@ -126,7 +149,7 @@ async def build_plan_async(
             deletes.append(
                 PlannedDelete(
                     mutation_id=stable_delete_mutation_id(
-                        unit.destination_id, unit.scope_key, name
+                        unit.destination_id, unit.scope_key, unit.kind, name
                     ),
                     deployment_id=owner_deployment,
                     target=TargetRef(
@@ -135,6 +158,7 @@ async def build_plan_async(
                         name=name,
                         scope=dict(unit.scope),
                     ),
+                    kind=unit.kind,
                 )
             )
     return Plan(strategy="always-write", puts=plan.puts, deletes=tuple(deletes))
@@ -144,26 +168,40 @@ def _inventory_units(
     config: RootConfig,
     selected: list[DeploymentDefinition],
 ) -> list[_InventoryUnit]:
-    """Group selected deployments into destination+scope inventory units."""
-    grouped: dict[tuple[str, str], dict[str, Any]] = {}
+    """Group selected deployments into destination+scope+kind inventory units."""
+    grouped: dict[tuple[str, str, str], dict[str, Any]] = {}
     for deployment in selected:
         destination = config.destinations[deployment.destination]
         scope = {str(k): _json_value(v) for k, v in deployment.scope.items()}
         scope_key = freeze_scope_key(scope)
-        key = (deployment.destination, scope_key)
-        bucket = grouped.get(key)
-        if bucket is None:
-            bucket = {
-                "destination_id": deployment.destination,
-                "connector_id": destination.connector,
-                "scope": scope,
-                "scope_key": scope_key,
-                "deployment_ids": [],
-                "intended_names": set(),
-            }
-            grouped[key] = bucket
-        bucket["deployment_ids"].append(deployment.name)
-        bucket["intended_names"].update(deployment.secrets.values())
+        for kind, names in (
+            (ValueKind.SECRET, deployment.secrets.values()),
+            (ValueKind.VARIABLE, deployment.variables.values()),
+        ):
+            name_list = list(names)
+            if not name_list and kind is ValueKind.VARIABLE and not deployment.variables:
+                # Only create a unit when the deployment publishes that kind.
+                continue
+            if not name_list and kind is ValueKind.SECRET and not deployment.secrets:
+                continue
+            if not name_list:
+                continue
+            key = (deployment.destination, scope_key, kind.value)
+            bucket = grouped.get(key)
+            if bucket is None:
+                bucket = {
+                    "destination_id": deployment.destination,
+                    "connector_id": destination.connector,
+                    "scope": scope,
+                    "scope_key": scope_key,
+                    "kind": kind,
+                    "deployment_ids": [],
+                    "intended_names": set(),
+                }
+                grouped[key] = bucket
+            if deployment.name not in bucket["deployment_ids"]:
+                bucket["deployment_ids"].append(deployment.name)
+            bucket["intended_names"].update(name_list)
 
     units: list[_InventoryUnit] = []
     for bucket in grouped.values():
@@ -173,6 +211,7 @@ def _inventory_units(
                 connector_id=bucket["connector_id"],
                 scope=bucket["scope"],
                 scope_key=bucket["scope_key"],
+                kind=bucket["kind"],
                 deployment_ids=tuple(bucket["deployment_ids"]),
                 intended_names=frozenset(bucket["intended_names"]),
             )
@@ -202,8 +241,13 @@ def stable_mutation_id(deployment_name: str, destination_name: str) -> str:
     return f"{deployment_name}:{destination_name}"
 
 
-def stable_delete_mutation_id(destination_id: str, scope_key: str, name: str) -> str:
-    return f"{destination_id}:{scope_key}:delete:{name}"
+def stable_delete_mutation_id(
+    destination_id: str,
+    scope_key: str,
+    kind: ValueKind,
+    name: str,
+) -> str:
+    return f"{destination_id}:{scope_key}:{kind.value}:delete:{name}"
 
 
 def compile_target(

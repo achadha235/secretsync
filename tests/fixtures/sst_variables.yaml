@@ -1,0 +1,25 @@
+version: 1
+changeDetection: always-write
+secrets:
+  apiKey:
+    env: API_KEY
+variables:
+  logLevel:
+    env: LOG_LEVEL
+sets:
+  production:
+    include: [apiKey, logLevel]
+destinations:
+  sst:
+    connector: sst
+    workingDirectory: ./apps/web
+deployments:
+  - name: sst-production
+    set: production
+    destination: sst
+    scope:
+      stage: production
+    secrets:
+      apiKey: ApiKey
+    variables:
+      logLevel: LogLevel

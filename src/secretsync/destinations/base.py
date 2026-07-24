@@ -8,7 +8,7 @@ from enum import StrEnum
 from typing import Literal, Protocol
 
 from secretsync.domain.errors import SafeError
-from secretsync.domain.models import JsonValue
+from secretsync.domain.models import JsonValue, ValueKind
 
 # Spec alias: connector-facing errors are SafeError payloads.
 SafeConnectorError = SafeError
@@ -60,6 +60,7 @@ class PutMutation:
     name: str
     value: bytearray
     scopes: tuple[Mapping[str, JsonValue], ...]
+    kind: ValueKind = ValueKind.SECRET
 
 
 @dataclass(slots=True)
@@ -67,6 +68,7 @@ class DeleteMutation:
     mutation_id: str
     name: str
     scopes: tuple[Mapping[str, JsonValue], ...]
+    kind: ValueKind = ValueKind.SECRET
 
 
 @dataclass(slots=True)
@@ -109,6 +111,10 @@ class ListNamesError(Exception):
 class Destination(Protocol):
     manifest: DestinationManifest
 
+    def check_kind_support(self, kind: ValueKind) -> Issue | None:
+        """Return None if this connector can publish `kind`, else an Issue to surface."""
+        ...
+
     async def validate(self, config: Mapping[str, JsonValue]) -> list[Issue]: ...
 
     async def list_names(
@@ -116,6 +122,8 @@ class Destination(Protocol):
         config: Mapping[str, JsonValue],
         scope: Mapping[str, JsonValue],
         context: OperationContext,
+        *,
+        kind: ValueKind = ValueKind.SECRET,
     ) -> frozenset[str]: ...
 
     async def apply(

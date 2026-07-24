@@ -43,12 +43,16 @@ Both Click and Textual use the same [`AppServices`](../src/secretsync/applicatio
 
 ## Always-write planning vs apply
 
-1. **Validate** — parse YAML, compose sets, check env **presence** (no value logging).
-2. **Plan** — emit value-free puts (logical id, source env **name**, destination name, scopes).
+1. **Validate** — parse YAML, compose sets, check env **presence** (no value logging), enforce secret/variable map membership and connector kind support.
+2. **Plan** — emit value-free puts (logical id, kind, source env **name**, destination name, scopes).
 3. **Confirm** — CLI prompt or TUI confirmation (always-write warning).
 4. **Apply** — resolve values late into `bytearray`, call connectors, scrub buffers, build `ApplyReport`.
 
 MVP does not detect value drift. `changeDetection: keyed-fingerprint` fails with `UNIMPLEMENTED_CHANGE_DETECTION`.
+
+### Secrets vs variables
+
+Top-level `secrets` and `variables` share the same `env` / `allowEmpty` shape but must use disjoint logical ids. Deployments publish via `secrets:` and/or `variables:` maps. Connectors derive the secure vs plaintext provider path from kind (GitHub APIs; Vercel env `type`). Inventory/prune units are `(destination, scope, kind)` so secret prune never deletes variables.
 
 ### Optional prune (plan-time remote reconcile)
 

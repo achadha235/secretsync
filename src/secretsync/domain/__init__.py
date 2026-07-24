@@ -1,7 +1,7 @@
 """Domain package."""
 
 from secretsync.domain.errors import SafeError, SecretSyncError
-from secretsync.domain.models import Plan, PlannedPut, SecretRef, TargetRef
+from secretsync.domain.models import Plan, PlannedPut, SecretRef, TargetRef, ValueKind
 
 __all__ = [
     "Plan",
@@ -10,4 +10,5 @@ __all__ = [
     "SecretRef",
     "SecretSyncError",
     "TargetRef",
+    "ValueKind",
 ]

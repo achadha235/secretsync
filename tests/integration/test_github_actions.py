@@ -235,3 +235,138 @@ async def test_delete_repository_secret() -> None:
     assert route.called
     assert result.results[0].status == "applied"
     assert result.results[0].effect == "deleted"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_variable_create() -> None:
+    from secretsync.domain.models import ValueKind
+
+    route = respx.post("https://api.github.com/repos/acme/web/actions/variables").mock(
+        return_value=httpx.Response(201)
+    )
+    dest = GitHubActionsFactory().create(_services())
+    result = await dest.apply(
+        ApplyDestinationRequest(
+            deployment_id="dep",
+            destination_config={
+                "connector": "github-actions",
+                "repository": "acme/web",
+                "auth": {"tokenEnv": "GITHUB_TOKEN"},
+            },
+            mutations=[
+                PutMutation(
+                    mutation_id="dep:LOG_LEVEL",
+                    name="LOG_LEVEL",
+                    value=bytearray(b"info"),
+                    scopes=({"kind": "repository"},),
+                    kind=ValueKind.VARIABLE,
+                )
+            ],
+        ),
+        OperationContext(correlation_id="c1"),
+    )
+    assert route.called
+    assert result.results[0].status == "applied"
+    assert result.results[0].effect == "created"
+    body = route.calls[0].request.read()
+    assert b'"name":"LOG_LEVEL"' in body or b'"name": "LOG_LEVEL"' in body
+    assert b"info" in body
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_variable_update_on_conflict() -> None:
+    from secretsync.domain.models import ValueKind
+
+    respx.post("https://api.github.com/repos/acme/web/actions/variables").mock(
+        return_value=httpx.Response(409)
+    )
+    patch = respx.patch("https://api.github.com/repos/acme/web/actions/variables/LOG_LEVEL").mock(
+        return_value=httpx.Response(204)
+    )
+    dest = GitHubActionsFactory().create(_services())
+    result = await dest.apply(
+        ApplyDestinationRequest(
+            deployment_id="dep",
+            destination_config={
+                "connector": "github-actions",
+                "repository": "acme/web",
+                "auth": {"tokenEnv": "GITHUB_TOKEN"},
+            },
+            mutations=[
+                PutMutation(
+                    mutation_id="dep:LOG_LEVEL",
+                    name="LOG_LEVEL",
+                    value=bytearray(b"debug"),
+                    scopes=({"kind": "repository"},),
+                    kind=ValueKind.VARIABLE,
+                )
+            ],
+        ),
+        OperationContext(correlation_id="c1"),
+    )
+    assert patch.called
+    assert result.results[0].status == "applied"
+    assert result.results[0].effect == "updated"
+    assert result.requests_made == 2
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_list_variable_names() -> None:
+    from secretsync.domain.models import ValueKind
+
+    respx.get("https://api.github.com/repos/acme/web/actions/variables").mock(
+        return_value=httpx.Response(
+            200,
+            json={"total_count": 1, "variables": [{"name": "LOG_LEVEL", "value": "info"}]},
+        )
+    )
+    dest = GitHubActionsFactory().create(_services())
+    names = await dest.list_names(
+        {
+            "connector": "github-actions",
+            "repository": "acme/web",
+            "auth": {"tokenEnv": "GITHUB_TOKEN"},
+        },
+        {"kind": "repository"},
+        OperationContext(correlation_id="c1"),
+        kind=ValueKind.VARIABLE,
+    )
+    assert names == frozenset({"LOG_LEVEL"})
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_delete_variable() -> None:
+    from secretsync.destinations.base import DeleteMutation
+    from secretsync.domain.models import ValueKind
+
+    route = respx.delete("https://api.github.com/repos/acme/web/actions/variables/ORPHAN").mock(
+        return_value=httpx.Response(204)
+    )
+    dest = GitHubActionsFactory().create(_services())
+    result = await dest.apply(
+        ApplyDestinationRequest(
+            deployment_id="dep",
+            destination_config={
+                "connector": "github-actions",
+                "repository": "acme/web",
+                "auth": {"tokenEnv": "GITHUB_TOKEN"},
+            },
+            mutations=[],
+            deletes=[
+                DeleteMutation(
+                    mutation_id="dep:delete:ORPHAN",
+                    name="ORPHAN",
+                    scopes=({"kind": "repository"},),
+                    kind=ValueKind.VARIABLE,
+                )
+            ],
+        ),
+        OperationContext(correlation_id="c1"),
+    )
+    assert route.called
+    assert result.results[0].status == "applied"
+    assert result.results[0].effect == "deleted"

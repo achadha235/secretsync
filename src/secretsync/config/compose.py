@@ -1,10 +1,10 @@
-"""Set inheritance, overrides, and composed secret availability."""
+"""Set inheritance, overrides, and composed secret/variable availability."""
 
 from __future__ import annotations
 
 from secretsync.config.models import RootConfig, SecretDefinition, SetDefinition
 from secretsync.domain.errors import ConfigInvalidError
-from secretsync.domain.models import SecretRef
+from secretsync.domain.models import SecretRef, ValueKind
 
 
 class ComposedSet:
@@ -20,7 +20,7 @@ class ComposedSet:
             return self._members[logical_id]
         except KeyError as exc:
             raise ConfigInvalidError(
-                f"Logical secret '{logical_id}' is not available in set '{self.set_id}'"
+                f"Logical id '{logical_id}' is not available in set '{self.set_id}'"
             ) from exc
 
     def get(self, logical_id: str) -> SecretRef | None:
@@ -32,11 +32,11 @@ class ComposedSet:
 
 def compose_sets(
     secrets: dict[str, SecretDefinition],
+    variables: dict[str, SecretDefinition],
     sets: dict[str, SetDefinition],
 ) -> dict[str, ComposedSet]:
     """Compose all sets with deterministic inheritance and overrides."""
-    for secret_id in secrets:
-        _validate_logical_id(secret_id)
+    catalog = _build_catalog(secrets, variables)
 
     composed: dict[str, ComposedSet] = {}
     visiting: set[str] = set()
@@ -59,16 +59,14 @@ def compose_sets(
             members.update(parent.as_dict())
 
         for logical_id in definition.include:
-            if logical_id not in secrets:
-                raise ConfigInvalidError(f"Set '{set_id}' includes unknown secret '{logical_id}'")
-            # Re-including an already inherited secret keeps first declaration order.
-            if logical_id not in members:
-                secret = secrets[logical_id]
-                members[logical_id] = SecretRef(
-                    logical_id=logical_id,
-                    env_name=secret.env,
-                    allow_empty=secret.allow_empty,
+            if logical_id not in catalog:
+                raise ConfigInvalidError(
+                    f"Set '{set_id}' includes unknown id '{logical_id}' "
+                    "(not declared under secrets or variables)"
                 )
+            # Re-including an already inherited member keeps first declaration order.
+            if logical_id not in members:
+                members[logical_id] = catalog[logical_id]
 
         for logical_id, override in definition.overrides.items():
             if logical_id not in members:
@@ -85,6 +83,7 @@ def compose_sets(
                     if override.allow_empty is not None
                     else current.allow_empty
                 ),
+                kind=current.kind,
             )
 
         visiting.remove(set_id)
@@ -98,9 +97,33 @@ def compose_sets(
 
 
 def compose_from_config(config: RootConfig) -> dict[str, ComposedSet]:
-    return compose_sets(config.secrets, config.sets)
+    return compose_sets(config.secrets, config.variables, config.sets)
+
+
+def _build_catalog(
+    secrets: dict[str, SecretDefinition],
+    variables: dict[str, SecretDefinition],
+) -> dict[str, SecretRef]:
+    catalog: dict[str, SecretRef] = {}
+    for logical_id, definition in secrets.items():
+        _validate_logical_id(logical_id)
+        catalog[logical_id] = SecretRef(
+            logical_id=logical_id,
+            env_name=definition.env,
+            allow_empty=definition.allow_empty,
+            kind=ValueKind.SECRET,
+        )
+    for logical_id, definition in variables.items():
+        _validate_logical_id(logical_id)
+        catalog[logical_id] = SecretRef(
+            logical_id=logical_id,
+            env_name=definition.env,
+            allow_empty=definition.allow_empty,
+            kind=ValueKind.VARIABLE,
+        )
+    return catalog
 
 
 def _validate_logical_id(logical_id: str) -> None:
     if not logical_id or not logical_id.strip():
-        raise ConfigInvalidError("Logical secret ids must be non-empty")
+        raise ConfigInvalidError("Logical ids must be non-empty")

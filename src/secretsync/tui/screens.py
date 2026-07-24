@@ -224,13 +224,16 @@ class PlanScreen(Screen[None]):
                 for put in deploy_puts:
                     scope = dict(put.target.scope)
                     deploy_node.add_leaf(
-                        f"put {put.target.name} ← {put.source.env_name} scope={scope}"
+                        f"put ({put.source.kind.value}) {put.target.name} "
+                        f"← {put.source.env_name} scope={scope}"
                     )
             if visible_dels:
                 del_node = dest_node.add("deletes", expand=True)
                 for deletion in visible_dels:
                     scope = dict(deletion.target.scope)
-                    del_node.add_leaf(f"delete {deletion.target.name} scope={scope}")
+                    del_node.add_leaf(
+                        f"delete ({deletion.kind.value}) {deletion.target.name} scope={scope}"
+                    )
 
     @staticmethod
     def _matches_put(put: PlannedPut, needle: str) -> bool:

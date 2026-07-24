@@ -15,11 +15,21 @@ class Operation(StrEnum):
     DELETE = "delete"
 
 
+class ValueKind(StrEnum):
+    """Whether a logical id is a secret or a non-secret variable."""
+
+    SECRET = "secret"
+    VARIABLE = "variable"
+
+
 @dataclass(frozen=True, slots=True)
 class SecretRef:
+    """Env-backed value reference (secret or variable)."""
+
     logical_id: str
     env_name: str
     allow_empty: bool = False
+    kind: ValueKind = ValueKind.SECRET
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +53,7 @@ class PlannedDelete:
     mutation_id: str
     deployment_id: str
     target: TargetRef
+    kind: ValueKind = ValueKind.SECRET
 
 
 @dataclass(slots=True)

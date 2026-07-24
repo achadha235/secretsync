@@ -1,0 +1,25 @@
+version: 1
+changeDetection: always-write
+secrets:
+  apiKey:
+    env: API_KEY
+variables:
+  apiKey:
+    env: API_KEY_PUBLIC
+sets:
+  production:
+    include: [apiKey]
+destinations:
+  github:
+    connector: github-actions
+    repository: owner/repo
+    auth:
+      tokenEnv: GITHUB_TOKEN
+deployments:
+  - name: github-production
+    set: production
+    destination: github
+    scope:
+      kind: repository
+    secrets:
+      apiKey: API_KEY

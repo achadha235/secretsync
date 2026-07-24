@@ -27,13 +27,14 @@ from secretsync.destinations.base import (
     PutSemantics,
     SafeConnectorError,
 )
-from secretsync.domain.models import JsonValue
+from secretsync.domain.models import JsonValue, ValueKind
 from secretsync.infrastructure.http import HttpRequestError, request_with_retries
 from secretsync.infrastructure.redaction import scrub_bytearray
 
 GITHUB_API = "https://api.github.com"
 SECRET_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 REPO_RE = re.compile(r"^[^/\s]+/[^/\s]+$")
+VARIABLE_NAME_RE = SECRET_NAME_RE
 
 
 def _capabilities() -> DestinationCapabilities:
@@ -105,11 +106,17 @@ class GitHubActionsDestination:
             )
         return issues
 
+    def check_kind_support(self, kind: ValueKind) -> Issue | None:
+        del kind
+        return None
+
     async def list_names(
         self,
         config: Mapping[str, JsonValue],
         scope: Mapping[str, JsonValue],
         context: OperationContext,
+        *,
+        kind: ValueKind = ValueKind.SECRET,
     ) -> frozenset[str]:
         parsed = _parse_repository(config)
         token_env = _token_env(config)
@@ -130,16 +137,16 @@ class GitHubActionsDestination:
                     correlation_id=context.correlation_id,
                 )
             )
-        kind = scope.get("kind")
-        if kind == "organization":
+        scope_kind = scope.get("kind")
+        if scope_kind == "organization":
             raise ListNamesError(
                 SafeConnectorError(
                     code="DESTINATION_INVALID",
-                    message="Organization secrets are not supported in MVP",
+                    message="Organization secrets/variables are not supported in MVP",
                     correlation_id=context.correlation_id,
                 )
             )
-        if kind == "environment" and not scope.get("environment"):
+        if scope_kind == "environment" and not scope.get("environment"):
             raise ListNamesError(
                 SafeConnectorError(
                     code="DESTINATION_INVALID",
@@ -147,7 +154,7 @@ class GitHubActionsDestination:
                     correlation_id=context.correlation_id,
                 )
             )
-        if kind not in {"repository", "environment"}:
+        if scope_kind not in {"repository", "environment"}:
             raise ListNamesError(
                 SafeConnectorError(
                     code="DESTINATION_INVALID",
@@ -163,12 +170,17 @@ class GitHubActionsDestination:
             "X-GitHub-Api-Version": "2022-11-28",
         }
         client = self.http_client_factory.create(headers=headers)
+        collection_key = "secrets" if kind is ValueKind.SECRET else "variables"
         names: set[str] = set()
         try:
             async with client:
                 page = 1
                 while True:
-                    url = _secrets_collection_url(owner, repo, scope)
+                    url = (
+                        _secrets_collection_url(owner, repo, scope)
+                        if kind is ValueKind.SECRET
+                        else _variables_collection_url(owner, repo, scope)
+                    )
                     response = await request_with_retries(
                         client,
                         "GET",
@@ -185,12 +197,12 @@ class GitHubActionsDestination:
                             )
                         )
                     payload = response.json()
-                    secrets = payload.get("secrets", []) if isinstance(payload, dict) else []
-                    if isinstance(secrets, list):
-                        for item in secrets:
+                    items = payload.get(collection_key, []) if isinstance(payload, dict) else []
+                    if isinstance(items, list):
+                        for item in items:
                             if isinstance(item, dict) and "name" in item:
                                 names.add(str(item["name"]))
-                    if not isinstance(secrets, list) or len(secrets) < 100:
+                    if not isinstance(items, list) or len(items) < 100:
                         break
                     page += 1
         except HttpRequestError as exc:
@@ -232,22 +244,25 @@ class GitHubActionsDestination:
             )
 
         owner, repo = parsed
-        # Group by scope for public-key caching; still one PUT per mutation.
+        secret_mutations = [m for m in request.mutations if m.kind is ValueKind.SECRET]
+        variable_mutations = [m for m in request.mutations if m.kind is ValueKind.VARIABLE]
+
+        # Group secrets by scope for public-key caching; still one PUT per mutation.
         by_scope: dict[str, list[PutMutation]] = {}
-        for mutation in request.mutations:
+        for mutation in secret_mutations:
             if not mutation.scopes:
                 by_scope.setdefault("invalid", []).append(mutation)
                 continue
             scope = dict(mutation.scopes[0])
-            kind = scope.get("kind")
-            if kind == "organization":
+            scope_kind = scope.get("kind")
+            if scope_kind == "organization":
                 by_scope.setdefault("organization", []).append(mutation)
-            elif kind == "environment":
+            elif scope_kind == "environment":
                 if not scope.get("environment"):
                     by_scope.setdefault("invalid", []).append(mutation)
                 else:
                     by_scope.setdefault(_scope_key(scope), []).append(mutation)
-            elif kind == "repository":
+            elif scope_kind == "repository":
                 by_scope.setdefault(_scope_key(scope), []).append(mutation)
             else:
                 by_scope.setdefault("invalid", []).append(mutation)
@@ -329,10 +344,28 @@ class GitHubActionsDestination:
                     for mutation in mutations:
                         tg.start_soon(put_one, mutation, scope, key_id, key_b64)
 
+            async def put_variable(mutation: PutMutation) -> None:
+                nonlocal requests_made
+                async with limiter:
+                    result, n = await self._put_variable(
+                        client, owner, repo, mutation, context.correlation_id
+                    )
+                    results[mutation.mutation_id] = result
+                    requests_made += n
+
+            async with anyio.create_task_group() as tg:
+                for mutation in variable_mutations:
+                    tg.start_soon(put_variable, mutation)
+
             for deletion in request.deletes:
-                result, n = await self._delete_secret(
-                    client, owner, repo, deletion, context.correlation_id
-                )
+                if deletion.kind is ValueKind.VARIABLE:
+                    result, n = await self._delete_variable(
+                        client, owner, repo, deletion, context.correlation_id
+                    )
+                else:
+                    result, n = await self._delete_secret(
+                        client, owner, repo, deletion, context.correlation_id
+                    )
                 results[deletion.mutation_id] = result
                 requests_made += n
 
@@ -479,6 +512,262 @@ class GitHubActionsDestination:
         finally:
             scrub_bytearray(ciphertext)
 
+    async def _put_variable(
+        self,
+        client: Any,
+        owner: str,
+        repo: str,
+        mutation: PutMutation,
+        correlation_id: str,
+    ) -> tuple[MutationResult, int]:
+        if not mutation.scopes:
+            return (
+                MutationResult(
+                    mutation_id=mutation.mutation_id,
+                    status="failed",
+                    error=SafeConnectorError(
+                        code="DESTINATION_INVALID",
+                        message="Missing GitHub scope on mutation",
+                        mutation_id=mutation.mutation_id,
+                        correlation_id=correlation_id,
+                    ),
+                ),
+                0,
+            )
+        scope = dict(mutation.scopes[0])
+        scope_kind = scope.get("kind")
+        if scope_kind == "organization":
+            return (
+                MutationResult(
+                    mutation_id=mutation.mutation_id,
+                    status="failed",
+                    error=SafeConnectorError(
+                        code="DESTINATION_INVALID",
+                        message="Organization variables are not supported in MVP",
+                        mutation_id=mutation.mutation_id,
+                        correlation_id=correlation_id,
+                    ),
+                ),
+                0,
+            )
+        if scope_kind not in {"repository", "environment"} or (
+            scope_kind == "environment" and not scope.get("environment")
+        ):
+            return (
+                MutationResult(
+                    mutation_id=mutation.mutation_id,
+                    status="failed",
+                    error=SafeConnectorError(
+                        code="DESTINATION_INVALID",
+                        message="Invalid GitHub scope; require kind repository|environment",
+                        mutation_id=mutation.mutation_id,
+                        correlation_id=correlation_id,
+                    ),
+                ),
+                0,
+            )
+        if not VARIABLE_NAME_RE.match(mutation.name):
+            return (
+                MutationResult(
+                    mutation_id=mutation.mutation_id,
+                    status="failed",
+                    error=SafeConnectorError(
+                        code="DESTINATION_INVALID",
+                        message=f"Invalid GitHub variable name '{mutation.name}'",
+                        mutation_id=mutation.mutation_id,
+                        correlation_id=correlation_id,
+                    ),
+                ),
+                0,
+            )
+
+        value = bytes(mutation.value).decode("utf-8")
+        collection = _variables_collection_url(owner, repo, scope)
+        item = _variable_item_url(owner, repo, scope, mutation.name)
+        try:
+            create = await request_with_retries(
+                client,
+                "POST",
+                collection,
+                mutation_id=mutation.mutation_id,
+                correlation_id=correlation_id,
+                json={"name": mutation.name, "value": value},
+            )
+            if create.status_code == 201:
+                return (
+                    MutationResult(
+                        mutation_id=mutation.mutation_id,
+                        status="applied",
+                        effect="created",
+                    ),
+                    1,
+                )
+            if create.status_code in {409, 422}:
+                update = await request_with_retries(
+                    client,
+                    "PATCH",
+                    item,
+                    mutation_id=mutation.mutation_id,
+                    correlation_id=correlation_id,
+                    json={"name": mutation.name, "value": value},
+                )
+                if update.status_code in {200, 204}:
+                    return (
+                        MutationResult(
+                            mutation_id=mutation.mutation_id,
+                            status="applied",
+                            effect="updated",
+                        ),
+                        2,
+                    )
+                from secretsync.infrastructure.http import error_for_status
+
+                return (
+                    MutationResult(
+                        mutation_id=mutation.mutation_id,
+                        status="failed",
+                        error=error_for_status(
+                            update.status_code,
+                            mutation_id=mutation.mutation_id,
+                            correlation_id=correlation_id,
+                        ),
+                    ),
+                    2,
+                )
+            from secretsync.infrastructure.http import error_for_status
+
+            return (
+                MutationResult(
+                    mutation_id=mutation.mutation_id,
+                    status="failed",
+                    error=error_for_status(
+                        create.status_code,
+                        mutation_id=mutation.mutation_id,
+                        correlation_id=correlation_id,
+                    ),
+                ),
+                1,
+            )
+        except HttpRequestError as exc:
+            return (
+                MutationResult(
+                    mutation_id=mutation.mutation_id,
+                    status="failed",
+                    error=exc.safe,
+                ),
+                1,
+            )
+
+    async def _delete_variable(
+        self,
+        client: Any,
+        owner: str,
+        repo: str,
+        deletion: DeleteMutation,
+        correlation_id: str,
+    ) -> tuple[MutationResult, int]:
+        if not deletion.scopes:
+            return (
+                MutationResult(
+                    mutation_id=deletion.mutation_id,
+                    status="failed",
+                    error=SafeConnectorError(
+                        code="DESTINATION_INVALID",
+                        message="Missing GitHub scope on delete",
+                        mutation_id=deletion.mutation_id,
+                        correlation_id=correlation_id,
+                    ),
+                ),
+                0,
+            )
+        scope = dict(deletion.scopes[0])
+        scope_kind = scope.get("kind")
+        if scope_kind == "organization":
+            return (
+                MutationResult(
+                    mutation_id=deletion.mutation_id,
+                    status="failed",
+                    error=SafeConnectorError(
+                        code="DESTINATION_INVALID",
+                        message="Organization variables are not supported in MVP",
+                        mutation_id=deletion.mutation_id,
+                        correlation_id=correlation_id,
+                    ),
+                ),
+                0,
+            )
+        if scope_kind not in {"repository", "environment"} or (
+            scope_kind == "environment" and not scope.get("environment")
+        ):
+            return (
+                MutationResult(
+                    mutation_id=deletion.mutation_id,
+                    status="failed",
+                    error=SafeConnectorError(
+                        code="DESTINATION_INVALID",
+                        message="Invalid GitHub scope; require kind repository|environment",
+                        mutation_id=deletion.mutation_id,
+                        correlation_id=correlation_id,
+                    ),
+                ),
+                0,
+            )
+        if not VARIABLE_NAME_RE.match(deletion.name):
+            return (
+                MutationResult(
+                    mutation_id=deletion.mutation_id,
+                    status="failed",
+                    error=SafeConnectorError(
+                        code="DESTINATION_INVALID",
+                        message=f"Invalid GitHub variable name '{deletion.name}'",
+                        mutation_id=deletion.mutation_id,
+                        correlation_id=correlation_id,
+                    ),
+                ),
+                0,
+            )
+        url = _variable_item_url(owner, repo, scope, deletion.name)
+        try:
+            response = await request_with_retries(
+                client,
+                "DELETE",
+                url,
+                mutation_id=deletion.mutation_id,
+                correlation_id=correlation_id,
+            )
+            if response.status_code in {204, 404}:
+                return (
+                    MutationResult(
+                        mutation_id=deletion.mutation_id,
+                        status="applied",
+                        effect="deleted",
+                    ),
+                    1,
+                )
+            from secretsync.infrastructure.http import error_for_status
+
+            return (
+                MutationResult(
+                    mutation_id=deletion.mutation_id,
+                    status="failed",
+                    error=error_for_status(
+                        response.status_code,
+                        mutation_id=deletion.mutation_id,
+                        correlation_id=correlation_id,
+                    ),
+                ),
+                1,
+            )
+        except HttpRequestError as exc:
+            return (
+                MutationResult(
+                    mutation_id=deletion.mutation_id,
+                    status="failed",
+                    error=exc.safe,
+                ),
+                1,
+            )
+
     async def _delete_secret(
         self,
         client: Any,
@@ -606,12 +895,28 @@ def _secret_item_url(owner: str, repo: str, scope: Mapping[str, JsonValue], name
     return f"{GITHUB_API}/repos/{owner}/{repo}/actions/secrets/{name}"
 
 
+def _variables_collection_url(owner: str, repo: str, scope: Mapping[str, JsonValue]) -> str:
+    kind = scope.get("kind")
+    if kind == "environment":
+        env_name = quote(str(scope["environment"]), safe="")
+        return f"{GITHUB_API}/repos/{owner}/{repo}/environments/{env_name}/variables"
+    return f"{GITHUB_API}/repos/{owner}/{repo}/actions/variables"
+
+
+def _variable_item_url(owner: str, repo: str, scope: Mapping[str, JsonValue], name: str) -> str:
+    kind = scope.get("kind")
+    if kind == "environment":
+        env_name = quote(str(scope["environment"]), safe="")
+        return f"{GITHUB_API}/repos/{owner}/{repo}/environments/{env_name}/variables/{name}"
+    return f"{GITHUB_API}/repos/{owner}/{repo}/actions/variables/{name}"
+
+
 @dataclass(frozen=True, slots=True)
 class GitHubActionsFactory:
     manifest: DestinationManifest = field(
         default_factory=lambda: DestinationManifest(
             id="github-actions",
-            version="0.1.0+actions-secrets",
+            version="0.2.0+actions-secrets-variables",
             capabilities=_capabilities(),
         )
     )

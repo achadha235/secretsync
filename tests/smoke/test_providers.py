@@ -63,6 +63,7 @@ async def test_vercel_smoke_upsert() -> None:
     from secretsync.application.services import create_services
     from secretsync.destinations.base import ApplyDestinationRequest, OperationContext, PutMutation
     from secretsync.destinations.vercel import VercelFactory
+    from secretsync.domain.models import ValueKind
 
     services = create_services({"VERCEL_TOKEN": token})
     dest = VercelFactory().create(services)
@@ -82,7 +83,8 @@ async def test_vercel_smoke_upsert() -> None:
                     mutation_id="smoke:SECRETSYNC_SMOKE",
                     name="SECRETSYNC_SMOKE",
                     value=bytearray(b"smoke-ok"),
-                    scopes=({"targets": ["preview"], "sensitive": True},),
+                    scopes=({"targets": ["preview"]},),
+                    kind=ValueKind.SECRET,
                 )
             ],
         ),

@@ -64,7 +64,6 @@ deployments:
     destination: vercel
     scope:
       targets: [production]
-      sensitive: true
     secrets:
       secretOneProd: SECRET_ONE
       secretTwoCommon: SECRET_TWO
@@ -94,4 +93,7 @@ AWS_REGION="us-east-1"
 # SECRET_ONE_PROD="op://vault/app/secret-one-prod"
 # SECRET_ONE_STAGING="op://vault/app/secret-one-staging"
 # SECRET_TWO_COMMON="op://vault/app/secret-two-common"
+# Optional non-secret variables (declare under top-level variables:):
+# PUBLIC_APP_URL="https://example.com"
+# LOG_LEVEL="info"
 """

@@ -98,3 +98,56 @@ def test_plan_contains_no_secret_values() -> None:
     rendered = repr(plan)
     for value in FULL_ENV.values():
         assert value not in rendered
+
+
+def test_id_overlap_rejected() -> None:
+    services = create_services({"API_KEY": "x", "API_KEY_PUBLIC": "y", "GITHUB_TOKEN": "t"})
+    result = validate_config(services, fixture_path("id_overlap.yaml"))
+    assert not result.ok
+    assert "overlap" in result.issues[0].message.lower()
+
+
+def test_wrong_map_secret_rejected() -> None:
+    services = create_services({"API_KEY": "x", "LOG_LEVEL": "info", "GITHUB_TOKEN": "t"})
+    result = validate_config(services, fixture_path("wrong_map_secret.yaml"))
+    assert not result.ok
+    assert "variables" in result.issues[0].message
+    assert result.issues[0].hint is not None
+    assert "deployment.variables" in result.issues[0].hint
+
+
+def test_sst_variables_rejected_with_linkable_hint() -> None:
+    services = create_services({"API_KEY": "x", "LOG_LEVEL": "info"})
+    result = validate_config(services, fixture_path("sst_variables.yaml"))
+    assert not result.ok
+    assert "Linkable" in result.issues[0].message or "Linkable" in (result.issues[0].hint or "")
+    assert result.issues[0].hint is not None
+    assert "sst.dev/docs/component/linkable" in result.issues[0].hint
+    assert "Remove variables:" in result.issues[0].hint
+
+
+def test_vercel_sensitive_deprecated() -> None:
+    services = create_services({"API_KEY": "x", "VERCEL_TOKEN": "t"})
+    result = validate_config(services, fixture_path("vercel_sensitive_deprecated.yaml"))
+    assert not result.ok
+    assert "scope.sensitive" in result.issues[0].message
+    assert result.issues[0].hint is not None
+    assert "deployment.variables" in result.issues[0].hint
+
+
+def test_mixed_variables_plan_emits_kinds() -> None:
+    from secretsync.domain.models import ValueKind
+
+    services = create_services(
+        {"API_KEY": "x", "LOG_LEVEL": "info", "GITHUB_TOKEN": "t", "VERCEL_TOKEN": "v"}
+    )
+    config = ConfigLoader().load(fixture_path("variables_mixed.yaml"))
+    composed = compose_from_config(config)
+    plan = build_plan(config, composed)
+    kinds = {(p.source.logical_id, p.source.kind, p.target.destination_id) for p in plan.puts}
+    assert ("apiKey", ValueKind.SECRET, "github") in kinds
+    assert ("logLevel", ValueKind.VARIABLE, "github") in kinds
+    assert ("apiKey", ValueKind.SECRET, "vercel") in kinds
+    assert ("logLevel", ValueKind.VARIABLE, "vercel") in kinds
+    result = validate_config(services, fixture_path("variables_mixed.yaml"))
+    assert result.ok
