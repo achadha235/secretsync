@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from importlib.metadata import version
 
 from click.testing import CliRunner
 
@@ -45,6 +46,13 @@ def test_clear_cli_with_phrase() -> None:
     )
     assert result.exit_code == 0
     assert "applied=0" in result.output
+
+
+def test_version() -> None:
+    runner = CliRunner()
+    result = runner.invoke(cli, ["version"])
+    assert result.exit_code == 0
+    assert result.output == f"{version('secretsync-cli')}\n"
 
 
 def test_validate_cli_ok() -> None:

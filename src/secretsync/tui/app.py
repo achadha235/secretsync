@@ -7,6 +7,7 @@ from pathlib import Path
 from textual.app import App
 from textual.binding import Binding
 
+from secretsync import __version__
 from secretsync.application.apply import ApplyReport
 from secretsync.application.services import AppServices
 from secretsync.domain.models import Plan
@@ -18,6 +19,7 @@ class SecretSyncApp(App[ApplyReport | None]):
 
     CSS_PATH = "secretsync.tcss"
     TITLE = "SecretSync"
+    SUB_TITLE = f"v{__version__}"
     BINDINGS = [
         Binding("q", "quit_app", "Quit", show=True),
         Binding("r", "reload", "Reload", show=True),
