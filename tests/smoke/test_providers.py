@@ -67,13 +67,14 @@ async def test_vercel_smoke_upsert() -> None:
 
     services = create_services({"VERCEL_TOKEN": token})
     dest = VercelFactory().create(services)
+    if not team:
+        pytest.skip("SECRETSYNC_SMOKE_VERCEL_TEAM_ID required")
     config: dict[str, object] = {
         "connector": "vercel",
         "project": project,
+        "teamId": team,
         "auth": {"tokenEnv": "VERCEL_TOKEN"},
     }
-    if team:
-        config["teamId"] = team
     result = await dest.apply(
         ApplyDestinationRequest(
             deployment_id="smoke",
@@ -83,7 +84,7 @@ async def test_vercel_smoke_upsert() -> None:
                     mutation_id="smoke:SECRETSYNC_SMOKE",
                     name="SECRETSYNC_SMOKE",
                     value=bytearray(b"smoke-ok"),
-                    scopes=({"targets": ["preview"]},),
+                    scopes=({"kind": "environment", "targets": ["preview"]},),
                     kind=ValueKind.SECRET,
                 )
             ],

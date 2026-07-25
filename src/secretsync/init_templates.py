@@ -32,7 +32,8 @@ destinations:
       tokenEnv: GITHUB_TOKEN
   vercel:
     connector: vercel
-    project: my-project
+    teamId: team_xxx
+    project: my-project  # required for scope.kind=environment
     auth:
       tokenEnv: VERCEL_TOKEN
   sst:
@@ -63,10 +64,21 @@ deployments:
     set: production
     destination: vercel
     scope:
+      kind: environment
       targets: [production]
     secrets:
       secretOneProd: SECRET_ONE
       secretTwoCommon: SECRET_TWO
+  # Team shared env (optional projects link set):
+  # - name: vercel-shared
+  #   set: production
+  #   destination: vercel
+  #   scope:
+  #     kind: shared-environment
+  #     targets: [production]
+  #     projects: [prj_abc, prj_def]
+  #   secrets:
+  #     secretTwoCommon: SHARED_SECRET
   - name: sst-staging
     set: staging
     destination: sst
