@@ -648,11 +648,11 @@ class VercelDestination:
         results: dict[str, MutationResult] = {}
         requests = list_requests
 
-        for chunk in _chunks_pairs(to_update, SHARED_MAX_ITEMS):
+        for update_chunk in _chunks(to_update, SHARED_MAX_ITEMS):
             chunk_results, n = await self._patch_shared(
                 client,
                 team_id=team_id,
-                updates=chunk,
+                updates=update_chunk,
                 correlation_id=correlation_id,
             )
             requests += n
@@ -670,11 +670,11 @@ class VercelDestination:
             groups.setdefault(key, []).append(mutation)
 
         for (env_type, targets, projects), group in groups.items():
-            for chunk in _chunks(group, SHARED_MAX_ITEMS):
+            for create_chunk in _chunks(group, SHARED_MAX_ITEMS):
                 chunk_results, n = await self._create_shared(
                     client,
                     team_id=team_id,
-                    mutations=chunk,
+                    mutations=create_chunk,
                     env_type=env_type,
                     targets=list(targets),
                     projects=list(projects),
@@ -909,7 +909,7 @@ class VercelDestination:
         requests = list_requests
         url = f"{VERCEL_API}{SHARED_ENV_PATH}"
         params = {"teamId": team_id}
-        for chunk in _chunks_pairs(pending, SHARED_MAX_ITEMS):
+        for chunk in _chunks(pending, SHARED_MAX_ITEMS):
             ids = [env_id for _, env_id in chunk]
             try:
                 response = await request_with_retries(
@@ -1168,13 +1168,7 @@ class VercelDestination:
         return results, requests
 
 
-def _chunks(items: Sequence[PutMutation], size: int) -> list[Sequence[PutMutation]]:
-    if not items:
-        return []
-    return [items[i : i + size] for i in range(0, len(items), size)]
-
-
-def _chunks_pairs[T](items: Sequence[T], size: int) -> list[Sequence[T]]:
+def _chunks[T](items: Sequence[T], size: int) -> list[Sequence[T]]:
     if not items:
         return []
     return [items[i : i + size] for i in range(0, len(items), size)]

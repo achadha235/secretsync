@@ -220,7 +220,7 @@ def _validate_vercel_deployment(deployment: DeploymentDefinition, destination: o
     project = _project(dest_cfg)
     for kind in kinds:
         reason = _validate_scope(
-            deployment.scope,  # type: ignore[arg-type]
+            deployment.scope,
             kind=kind,
             destination_project=project,
         )
