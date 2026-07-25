@@ -1,4 +1,4 @@
-"""GitHub Actions secrets destination (repository + environment scopes)."""
+"""GitHub Actions secrets destination (repository, environment, organization scopes)."""
 
 from __future__ import annotations
 
@@ -35,6 +35,9 @@ GITHUB_API = "https://api.github.com"
 SECRET_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 REPO_RE = re.compile(r"^[^/\s]+/[^/\s]+$")
 VARIABLE_NAME_RE = SECRET_NAME_RE
+ORG_VISIBILITIES = frozenset({"all", "private", "selected"})
+VALID_SCOPE_KINDS = frozenset({"repository", "environment", "organization"})
+SCOPE_KIND_MESSAGE = "Invalid GitHub scope; require kind repository|environment|organization"
 
 
 def _capabilities() -> DestinationCapabilities:
@@ -77,7 +80,52 @@ def _scope_key(scope: Mapping[str, JsonValue]) -> str:
     kind = str(scope.get("kind", ""))
     if kind == "environment":
         return f"environment:{scope.get('environment', '')}"
+    if kind == "organization":
+        visibility = scope.get("visibility", "private")
+        ids = scope.get("selected_repository_ids")
+        if visibility == "selected" and isinstance(ids, list):
+            return f"organization:{visibility}:{','.join(str(i) for i in ids)}"
+        return f"organization:{visibility}"
     return "repository"
+
+
+def _public_key_cache_key(scope: Mapping[str, JsonValue]) -> str:
+    # ponytail: one org public key shared across visibility variants
+    if scope.get("kind") == "organization":
+        return "organization"
+    return _scope_key(scope)
+
+
+def _org_visibility_payload(scope: Mapping[str, JsonValue]) -> dict[str, JsonValue] | str:
+    """Return visibility fields for org create/update, or an error message."""
+    visibility = scope.get("visibility", "private")
+    if visibility not in ORG_VISIBILITIES:
+        return "Invalid organization visibility; require all|private|selected"
+    payload: dict[str, JsonValue] = {"visibility": str(visibility)}
+    if visibility == "selected":
+        ids = scope.get("selected_repository_ids")
+        # bool is a subclass of int; reject it explicitly.
+        valid_ids = (
+            isinstance(ids, list)
+            and bool(ids)
+            and all(isinstance(i, int) and not isinstance(i, bool) for i in ids)
+        )
+        if not valid_ids:
+            return (
+                "selected_repository_ids required as non-empty int array "
+                "when visibility is selected"
+            )
+        payload["selected_repository_ids"] = list(ids)  # type: ignore[arg-type]
+    return payload
+
+
+def _invalid_scope_kind(scope: Mapping[str, JsonValue]) -> str | None:
+    kind = scope.get("kind")
+    if kind == "environment" and not scope.get("environment"):
+        return "Invalid GitHub scope; environment name required"
+    if kind not in VALID_SCOPE_KINDS:
+        return SCOPE_KIND_MESSAGE
+    return None
 
 
 @dataclass
@@ -137,28 +185,12 @@ class GitHubActionsDestination:
                     correlation_id=context.correlation_id,
                 )
             )
-        scope_kind = scope.get("kind")
-        if scope_kind == "organization":
+        scope_error = _invalid_scope_kind(scope)
+        if scope_error is not None:
             raise ListNamesError(
                 SafeConnectorError(
                     code="DESTINATION_INVALID",
-                    message="Organization secrets/variables are not supported in MVP",
-                    correlation_id=context.correlation_id,
-                )
-            )
-        if scope_kind == "environment" and not scope.get("environment"):
-            raise ListNamesError(
-                SafeConnectorError(
-                    code="DESTINATION_INVALID",
-                    message="Invalid GitHub scope; environment name required",
-                    correlation_id=context.correlation_id,
-                )
-            )
-        if scope_kind not in {"repository", "environment"}:
-            raise ListNamesError(
-                SafeConnectorError(
-                    code="DESTINATION_INVALID",
-                    message="Invalid GitHub scope; require kind repository|environment",
+                    message=scope_error,
                     correlation_id=context.correlation_id,
                 )
             )
@@ -254,40 +286,21 @@ class GitHubActionsDestination:
                 by_scope.setdefault("invalid", []).append(mutation)
                 continue
             scope = dict(mutation.scopes[0])
-            scope_kind = scope.get("kind")
-            if scope_kind == "organization":
-                by_scope.setdefault("organization", []).append(mutation)
-            elif scope_kind == "environment":
-                if not scope.get("environment"):
-                    by_scope.setdefault("invalid", []).append(mutation)
-                else:
-                    by_scope.setdefault(_scope_key(scope), []).append(mutation)
-            elif scope_kind == "repository":
-                by_scope.setdefault(_scope_key(scope), []).append(mutation)
-            else:
+            if _invalid_scope_kind(scope) is not None:
                 by_scope.setdefault("invalid", []).append(mutation)
+            else:
+                by_scope.setdefault(_scope_key(scope), []).append(mutation)
 
         results: dict[str, MutationResult] = {}
         requests_made = 0
 
-        for mutation in by_scope.get("organization", []):
-            results[mutation.mutation_id] = MutationResult(
-                mutation_id=mutation.mutation_id,
-                status="failed",
-                error=SafeConnectorError(
-                    code="DESTINATION_INVALID",
-                    message="Organization secrets are not supported in MVP",
-                    mutation_id=mutation.mutation_id,
-                    correlation_id=context.correlation_id,
-                ),
-            )
         for mutation in by_scope.get("invalid", []):
             results[mutation.mutation_id] = MutationResult(
                 mutation_id=mutation.mutation_id,
                 status="failed",
                 error=SafeConnectorError(
                     code="DESTINATION_INVALID",
-                    message="Invalid GitHub scope; require kind repository|environment",
+                    message=SCOPE_KIND_MESSAGE,
                     mutation_id=mutation.mutation_id,
                     correlation_id=context.correlation_id,
                 ),
@@ -302,9 +315,24 @@ class GitHubActionsDestination:
         limiter = anyio.CapacityLimiter(self.put_concurrency)
         async with client:
             for scope_id, mutations in by_scope.items():
-                if scope_id in {"organization", "invalid"}:
+                if scope_id == "invalid":
                     continue
                 scope = dict(mutations[0].scopes[0])
+                if scope.get("kind") == "organization":
+                    visibility = _org_visibility_payload(scope)
+                    if isinstance(visibility, str):
+                        for mutation in mutations:
+                            results[mutation.mutation_id] = MutationResult(
+                                mutation_id=mutation.mutation_id,
+                                status="failed",
+                                error=SafeConnectorError(
+                                    code="DESTINATION_INVALID",
+                                    message=visibility,
+                                    mutation_id=mutation.mutation_id,
+                                    correlation_id=context.correlation_id,
+                                ),
+                            )
+                        continue
                 try:
                     key_id, key_b64, key_requests = await self._get_public_key(
                         client, owner, repo, scope, context.correlation_id
@@ -342,7 +370,7 @@ class GitHubActionsDestination:
 
                 async with anyio.create_task_group() as tg:
                     for mutation in mutations:
-                        tg.start_soon(put_one, mutation, scope, key_id, key_b64)
+                        tg.start_soon(put_one, mutation, dict(mutation.scopes[0]), key_id, key_b64)
 
             async def put_variable(mutation: PutMutation) -> None:
                 nonlocal requests_made
@@ -395,13 +423,15 @@ class GitHubActionsDestination:
         scope: Mapping[str, JsonValue],
         correlation_id: str,
     ) -> tuple[str, str, int]:
-        cache_key = _scope_key(scope)
+        cache_key = _public_key_cache_key(scope)
         if cache_key in self._public_keys:
             key_id, key_b64 = self._public_keys[cache_key]
             return key_id, key_b64, 0
 
         kind = scope.get("kind")
-        if kind == "environment":
+        if kind == "organization":
+            url = f"{GITHUB_API}/orgs/{owner}/actions/secrets/public-key"
+        elif kind == "environment":
             env_name = quote(str(scope["environment"]), safe="")
             url = f"{GITHUB_API}/repos/{owner}/{repo}/environments/{env_name}/secrets/public-key"
         else:
@@ -446,19 +476,32 @@ class GitHubActionsDestination:
                 0,
             )
 
+        body: dict[str, JsonValue] = {}
+        if scope.get("kind") == "organization":
+            visibility = _org_visibility_payload(scope)
+            if isinstance(visibility, str):
+                return (
+                    MutationResult(
+                        mutation_id=mutation.mutation_id,
+                        status="failed",
+                        error=SafeConnectorError(
+                            code="DESTINATION_INVALID",
+                            message=visibility,
+                            mutation_id=mutation.mutation_id,
+                            correlation_id=correlation_id,
+                        ),
+                    ),
+                    0,
+                )
+            body.update(visibility)
+
         ciphertext = bytearray()
         try:
             encrypted = encrypt_github_secret(key_b64, bytes(mutation.value))
             ciphertext.extend(encrypted.encode("utf-8"))
-            kind = scope.get("kind")
-            if kind == "environment":
-                env_name = quote(str(scope["environment"]), safe="")
-                url = (
-                    f"{GITHUB_API}/repos/{owner}/{repo}/environments/{env_name}"
-                    f"/secrets/{mutation.name}"
-                )
-            else:
-                url = f"{GITHUB_API}/repos/{owner}/{repo}/actions/secrets/{mutation.name}"
+            body["encrypted_value"] = encrypted
+            body["key_id"] = key_id
+            url = _secret_item_url(owner, repo, scope, mutation.name)
 
             response = await request_with_retries(
                 client,
@@ -466,7 +509,7 @@ class GitHubActionsDestination:
                 url,
                 mutation_id=mutation.mutation_id,
                 correlation_id=correlation_id,
-                json={"encrypted_value": encrypted, "key_id": key_id},
+                json=body,
             )
             if response.status_code == 201:
                 return (
@@ -535,31 +578,15 @@ class GitHubActionsDestination:
                 0,
             )
         scope = dict(mutation.scopes[0])
-        scope_kind = scope.get("kind")
-        if scope_kind == "organization":
+        scope_error = _invalid_scope_kind(scope)
+        if scope_error is not None:
             return (
                 MutationResult(
                     mutation_id=mutation.mutation_id,
                     status="failed",
                     error=SafeConnectorError(
                         code="DESTINATION_INVALID",
-                        message="Organization variables are not supported in MVP",
-                        mutation_id=mutation.mutation_id,
-                        correlation_id=correlation_id,
-                    ),
-                ),
-                0,
-            )
-        if scope_kind not in {"repository", "environment"} or (
-            scope_kind == "environment" and not scope.get("environment")
-        ):
-            return (
-                MutationResult(
-                    mutation_id=mutation.mutation_id,
-                    status="failed",
-                    error=SafeConnectorError(
-                        code="DESTINATION_INVALID",
-                        message="Invalid GitHub scope; require kind repository|environment",
+                        message=scope_error,
                         mutation_id=mutation.mutation_id,
                         correlation_id=correlation_id,
                     ),
@@ -582,6 +609,25 @@ class GitHubActionsDestination:
             )
 
         value = bytes(mutation.value).decode("utf-8")
+        body: dict[str, JsonValue] = {"name": mutation.name, "value": value}
+        if scope.get("kind") == "organization":
+            visibility = _org_visibility_payload(scope)
+            if isinstance(visibility, str):
+                return (
+                    MutationResult(
+                        mutation_id=mutation.mutation_id,
+                        status="failed",
+                        error=SafeConnectorError(
+                            code="DESTINATION_INVALID",
+                            message=visibility,
+                            mutation_id=mutation.mutation_id,
+                            correlation_id=correlation_id,
+                        ),
+                    ),
+                    0,
+                )
+            body.update(visibility)
+
         collection = _variables_collection_url(owner, repo, scope)
         item = _variable_item_url(owner, repo, scope, mutation.name)
         try:
@@ -591,7 +637,7 @@ class GitHubActionsDestination:
                 collection,
                 mutation_id=mutation.mutation_id,
                 correlation_id=correlation_id,
-                json={"name": mutation.name, "value": value},
+                json=body,
             )
             if create.status_code == 201:
                 return (
@@ -609,7 +655,7 @@ class GitHubActionsDestination:
                     item,
                     mutation_id=mutation.mutation_id,
                     correlation_id=correlation_id,
-                    json={"name": mutation.name, "value": value},
+                    json=body,
                 )
                 if update.status_code in {200, 204}:
                     return (
@@ -681,31 +727,15 @@ class GitHubActionsDestination:
                 0,
             )
         scope = dict(deletion.scopes[0])
-        scope_kind = scope.get("kind")
-        if scope_kind == "organization":
+        scope_error = _invalid_scope_kind(scope)
+        if scope_error is not None:
             return (
                 MutationResult(
                     mutation_id=deletion.mutation_id,
                     status="failed",
                     error=SafeConnectorError(
                         code="DESTINATION_INVALID",
-                        message="Organization variables are not supported in MVP",
-                        mutation_id=deletion.mutation_id,
-                        correlation_id=correlation_id,
-                    ),
-                ),
-                0,
-            )
-        if scope_kind not in {"repository", "environment"} or (
-            scope_kind == "environment" and not scope.get("environment")
-        ):
-            return (
-                MutationResult(
-                    mutation_id=deletion.mutation_id,
-                    status="failed",
-                    error=SafeConnectorError(
-                        code="DESTINATION_INVALID",
-                        message="Invalid GitHub scope; require kind repository|environment",
+                        message=scope_error,
                         mutation_id=deletion.mutation_id,
                         correlation_id=correlation_id,
                     ),
@@ -791,31 +821,15 @@ class GitHubActionsDestination:
                 0,
             )
         scope = dict(deletion.scopes[0])
-        kind = scope.get("kind")
-        if kind == "organization":
+        scope_error = _invalid_scope_kind(scope)
+        if scope_error is not None:
             return (
                 MutationResult(
                     mutation_id=deletion.mutation_id,
                     status="failed",
                     error=SafeConnectorError(
                         code="DESTINATION_INVALID",
-                        message="Organization secrets are not supported in MVP",
-                        mutation_id=deletion.mutation_id,
-                        correlation_id=correlation_id,
-                    ),
-                ),
-                0,
-            )
-        if kind not in {"repository", "environment"} or (
-            kind == "environment" and not scope.get("environment")
-        ):
-            return (
-                MutationResult(
-                    mutation_id=deletion.mutation_id,
-                    status="failed",
-                    error=SafeConnectorError(
-                        code="DESTINATION_INVALID",
-                        message="Invalid GitHub scope; require kind repository|environment",
+                        message=scope_error,
                         mutation_id=deletion.mutation_id,
                         correlation_id=correlation_id,
                     ),
@@ -881,6 +895,8 @@ class GitHubActionsDestination:
 
 def _secrets_collection_url(owner: str, repo: str, scope: Mapping[str, JsonValue]) -> str:
     kind = scope.get("kind")
+    if kind == "organization":
+        return f"{GITHUB_API}/orgs/{owner}/actions/secrets"
     if kind == "environment":
         env_name = quote(str(scope["environment"]), safe="")
         return f"{GITHUB_API}/repos/{owner}/{repo}/environments/{env_name}/secrets"
@@ -889,6 +905,8 @@ def _secrets_collection_url(owner: str, repo: str, scope: Mapping[str, JsonValue
 
 def _secret_item_url(owner: str, repo: str, scope: Mapping[str, JsonValue], name: str) -> str:
     kind = scope.get("kind")
+    if kind == "organization":
+        return f"{GITHUB_API}/orgs/{owner}/actions/secrets/{name}"
     if kind == "environment":
         env_name = quote(str(scope["environment"]), safe="")
         return f"{GITHUB_API}/repos/{owner}/{repo}/environments/{env_name}/secrets/{name}"
@@ -897,6 +915,8 @@ def _secret_item_url(owner: str, repo: str, scope: Mapping[str, JsonValue], name
 
 def _variables_collection_url(owner: str, repo: str, scope: Mapping[str, JsonValue]) -> str:
     kind = scope.get("kind")
+    if kind == "organization":
+        return f"{GITHUB_API}/orgs/{owner}/actions/variables"
     if kind == "environment":
         env_name = quote(str(scope["environment"]), safe="")
         return f"{GITHUB_API}/repos/{owner}/{repo}/environments/{env_name}/variables"
@@ -905,6 +925,8 @@ def _variables_collection_url(owner: str, repo: str, scope: Mapping[str, JsonVal
 
 def _variable_item_url(owner: str, repo: str, scope: Mapping[str, JsonValue], name: str) -> str:
     kind = scope.get("kind")
+    if kind == "organization":
+        return f"{GITHUB_API}/orgs/{owner}/actions/variables/{name}"
     if kind == "environment":
         env_name = quote(str(scope["environment"]), safe="")
         return f"{GITHUB_API}/repos/{owner}/{repo}/environments/{env_name}/variables/{name}"
@@ -916,7 +938,7 @@ class GitHubActionsFactory:
     manifest: DestinationManifest = field(
         default_factory=lambda: DestinationManifest(
             id="github-actions",
-            version="0.2.0+actions-secrets-variables",
+            version="0.3.0+org-secrets-variables",
             capabilities=_capabilities(),
         )
     )

@@ -72,6 +72,19 @@ deployments:
     variables:
       # logical id → remote variable name (Actions Variables API)
       logLevel: LOG_LEVEL
+
+  # Org secrets/variables: org name is the owner of repository (acme from acme/web).
+  # Token needs admin:org (classic PAT). visibility defaults to private.
+  - name: github-org
+    set: production
+    destination: github
+    scope:
+      kind: organization
+      visibility: private # all | private | selected (+ selected_repository_ids)
+    secrets:
+      apiKey: API_KEY
+    variables:
+      logLevel: LOG_LEVEL
 ```
 
 Kind is declared once under `secrets` or `variables`. Connectors map kind to the provider primitive (GitHub secrets vs variables APIs; Vercel `type: sensitive` vs `encrypted`). SST supports secrets only — non-secret SST config belongs in code as [Linkables](https://sst.dev/docs/component/linkable/).
