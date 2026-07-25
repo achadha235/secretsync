@@ -33,8 +33,25 @@ from secretsync.infrastructure.redaction import scrub_bytearray
 
 GITHUB_API = "https://api.github.com"
 SECRET_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-REPO_RE = re.compile(r"^[^/\s]+/[^/\s]+$")
+OWNER_REPO_RE = re.compile(r"^[^/\s]+/[^/\s]+$")
+SEGMENT_RE = re.compile(r"^[^/\s]+$")
 VARIABLE_NAME_RE = SECRET_NAME_RE
+# Backward-compatible alias used by older tests / callers.
+REPO_RE = OWNER_REPO_RE
+
+
+@dataclass(frozen=True, slots=True)
+class GitHubRepoRef:
+    """Resolved GitHub owner + optional repository name."""
+
+    owner: str
+    repository: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ConfigParseError:
+    message: str
+    hint: str | None = None
 
 
 def _capabilities() -> DestinationCapabilities:
@@ -56,12 +73,139 @@ def encrypt_github_secret(public_key_b64: str, secret_value: bytes) -> str:
     return base64.b64encode(sealed).decode("utf-8")
 
 
+def _parse_github_target(
+    config: Mapping[str, JsonValue],
+) -> GitHubRepoRef | _ConfigParseError:
+    """Resolve destination organization/repository into an owner (+ optional repo).
+
+    Allowed:
+      - organization: org
+      - organization: org + repository: name  (name must not contain '/')
+      - repository: owner/name               (no organization field)
+
+    Rejected:
+      - organization + repository: owner/name (redundant or mismatched)
+      - repository: name without organization
+      - neither field set
+    """
+    raw_org = config.get("organization")
+    raw_repo = config.get("repository")
+
+    org: str | None = None
+    if raw_org is not None:
+        if not isinstance(raw_org, str) or not raw_org.strip():
+            return _ConfigParseError(
+                message="github-actions organization must be a non-empty string",
+                hint="Example: organization: my-org",
+            )
+        org = raw_org.strip()
+        if not SEGMENT_RE.match(org):
+            return _ConfigParseError(
+                message=(
+                    f"github-actions organization {org!r} must be a single path segment (no '/')"
+                ),
+                hint="Use organization: my-org — not an owner/repo string.",
+            )
+
+    repo: str | None = None
+    if raw_repo is not None:
+        if not isinstance(raw_repo, str) or not raw_repo.strip():
+            return _ConfigParseError(
+                message="github-actions repository must be a non-empty string",
+                hint="Use repository: owner/name, or organization: + repository: name.",
+            )
+        repo = raw_repo.strip()
+
+    if org is None and repo is None:
+        return _ConfigParseError(
+            message="github-actions requires organization and/or repository",
+            hint=(
+                "Set organization: my-org, or repository: owner/name, "
+                "or both as organization: my-org and repository: my-repo."
+            ),
+        )
+
+    if org is not None and repo is None:
+        return GitHubRepoRef(owner=org, repository=None)
+
+    assert repo is not None
+
+    if org is not None:
+        if "/" in repo:
+            if OWNER_REPO_RE.match(repo):
+                owner, _name = repo.split("/", 1)
+                if owner == org:
+                    return _ConfigParseError(
+                        message=(
+                            "github-actions must not set organization together with "
+                            "repository as 'owner/name'"
+                        ),
+                        hint=(
+                            f"Use repository: {_name!r} with organization: {org!r}, "
+                            f"or drop organization and keep repository: {repo!r}."
+                        ),
+                    )
+                return _ConfigParseError(
+                    message=(
+                        f"github-actions organization {org!r} does not match "
+                        f"repository owner {owner!r} in {repo!r}"
+                    ),
+                    hint=(
+                        f"Use organization: {owner!r} with repository: "
+                        f"{repo.split('/', 1)[1]!r}, or repository: {repo!r} alone."
+                    ),
+                )
+            return _ConfigParseError(
+                message=f"github-actions repository {repo!r} is invalid",
+                hint="With organization set, repository must be a bare repo name (no '/').",
+            )
+        if not SEGMENT_RE.match(repo):
+            return _ConfigParseError(
+                message=f"github-actions repository {repo!r} is invalid",
+                hint="With organization set, repository must be a bare repo name (no '/').",
+            )
+        return GitHubRepoRef(owner=org, repository=repo)
+
+    # repository alone — must be owner/name
+    if not OWNER_REPO_RE.match(repo):
+        return _ConfigParseError(
+            message=(
+                f"github-actions repository {repo!r} must be 'owner/name' "
+                "when organization is omitted"
+            ),
+            hint=("Use repository: owner/name, or set organization: owner and repository: name."),
+        )
+    owner, name = repo.split("/", 1)
+    return GitHubRepoRef(owner=owner, repository=name)
+
+
 def _parse_repository(config: Mapping[str, JsonValue]) -> tuple[str, str] | None:
-    raw = config.get("repository")
-    if not isinstance(raw, str) or not REPO_RE.match(raw):
+    """Return (owner, repo) when the destination resolves to a concrete repository."""
+    parsed = _parse_github_target(config)
+    if isinstance(parsed, _ConfigParseError) or parsed.repository is None:
         return None
-    owner, repo = raw.split("/", 1)
-    return owner, repo
+    return parsed.owner, parsed.repository
+
+
+def _require_repo_ref(
+    config: Mapping[str, JsonValue],
+) -> tuple[str, str] | _ConfigParseError:
+    """Like _parse_github_target, but require a concrete repository for repo/env ops."""
+    parsed = _parse_github_target(config)
+    if isinstance(parsed, _ConfigParseError):
+        return parsed
+    if parsed.repository is None:
+        return _ConfigParseError(
+            message=(
+                f"github-actions destination has organization {parsed.owner!r} "
+                "but no repository; repository/environment scopes require a repository"
+            ),
+            hint=(
+                f"Add repository: <repo-name> under the destination, or use "
+                f"repository: {parsed.owner}/<repo-name>."
+            ),
+        )
+    return parsed.owner, parsed.repository
 
 
 def _token_env(config: Mapping[str, JsonValue]) -> str | None:
@@ -90,11 +234,13 @@ class GitHubActionsDestination:
 
     async def validate(self, config: Mapping[str, JsonValue]) -> list[Issue]:
         issues: list[Issue] = []
-        if _parse_repository(config) is None:
+        parsed = _parse_github_target(config)
+        if isinstance(parsed, _ConfigParseError):
             issues.append(
                 Issue(
                     code="DESTINATION_INVALID",
-                    message="github-actions requires repository as 'owner/name'",
+                    message=parsed.message,
+                    hint=parsed.hint,
                 )
             )
         if _token_env(config) is None:
@@ -118,13 +264,20 @@ class GitHubActionsDestination:
         *,
         kind: ValueKind = ValueKind.SECRET,
     ) -> frozenset[str]:
-        parsed = _parse_repository(config)
+        parsed = _require_repo_ref(config)
         token_env = _token_env(config)
-        if parsed is None or token_env is None:
+        if isinstance(parsed, _ConfigParseError) or token_env is None:
+            message = (
+                parsed.message
+                if isinstance(parsed, _ConfigParseError)
+                else "Invalid github-actions destination configuration"
+            )
+            hint = parsed.hint if isinstance(parsed, _ConfigParseError) else None
             raise ListNamesError(
                 SafeConnectorError(
                     code="DESTINATION_INVALID",
-                    message="Invalid github-actions destination configuration",
+                    message=message,
+                    hint=hint,
                     correlation_id=context.correlation_id,
                 )
             )
@@ -215,15 +368,20 @@ class GitHubActionsDestination:
         context: OperationContext,
     ) -> ApplyDestinationResult:
         config = request.destination_config
-        parsed = _parse_repository(config)
+        parsed = _require_repo_ref(config)
         token_env = _token_env(config)
         all_ids = [m.mutation_id for m in request.mutations] + [
             d.mutation_id for d in request.deletes
         ]
-        if parsed is None or token_env is None:
+        if isinstance(parsed, _ConfigParseError) or token_env is None:
             error = SafeConnectorError(
                 code="DESTINATION_INVALID",
-                message="Invalid github-actions destination configuration",
+                message=(
+                    parsed.message
+                    if isinstance(parsed, _ConfigParseError)
+                    else "Invalid github-actions destination configuration"
+                ),
+                hint=parsed.hint if isinstance(parsed, _ConfigParseError) else None,
                 correlation_id=context.correlation_id,
             )
             return ApplyDestinationResult(

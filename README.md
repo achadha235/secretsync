@@ -54,7 +54,11 @@ sets:
 destinations:
   github:
     connector: github-actions
+    # Either repository: owner/name …
     repository: owner/repo
+    # … or organization: + repository: name (not both with owner/name)
+    # organization: owner
+    # repository: repo
     auth:
       tokenEnv: GITHUB_TOKEN # reads os.environ["GITHUB_TOKEN"] for API auth
 
