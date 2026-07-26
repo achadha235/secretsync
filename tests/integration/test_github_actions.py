@@ -21,10 +21,16 @@ def _mutation(
     *,
     kind: str = "repository",
     environment: str | None = None,
+    visibility: str | None = None,
+    selected_repository_ids: list[int] | None = None,
 ) -> PutMutation:
     scope: dict[str, object] = {"kind": kind}
     if environment is not None:
         scope["environment"] = environment
+    if visibility is not None:
+        scope["visibility"] = visibility
+    if selected_repository_ids is not None:
+        scope["selected_repository_ids"] = selected_repository_ids
     return PutMutation(
         mutation_id=f"dep:{name}",
         name=name,
@@ -148,7 +154,18 @@ async def test_429_retried_on_put() -> None:
 
 
 @pytest.mark.asyncio
-async def test_organization_rejected() -> None:
+@respx.mock
+async def test_organization_secret_put_defaults_private() -> None:
+    from nacl import encoding
+
+    key = public.PrivateKey.generate().public_key
+    key_b64 = key.encode(encoder=encoding.Base64Encoder).decode()
+    respx.get("https://api.github.com/orgs/acme/actions/secrets/public-key").mock(
+        return_value=httpx.Response(200, json={"key_id": "org-key", "key": key_b64})
+    )
+    put = respx.put("https://api.github.com/orgs/acme/actions/secrets/ORG_SECRET").mock(
+        return_value=httpx.Response(201)
+    )
     dest = GitHubActionsFactory().create(_services())
     result = await dest.apply(
         ApplyDestinationRequest(
@@ -158,13 +175,173 @@ async def test_organization_rejected() -> None:
                 "repository": "acme/web",
                 "auth": {"tokenEnv": "GITHUB_TOKEN"},
             },
-            mutations=[_mutation("A", kind="organization")],
+            mutations=[_mutation("ORG_SECRET", kind="organization")],
+        ),
+        OperationContext(correlation_id="c1"),
+    )
+    assert result.results[0].status == "applied"
+    assert result.results[0].effect == "created"
+    body = put.calls[0].request.read()
+    assert b'"visibility":"private"' in body or b'"visibility": "private"' in body
+    assert b"encrypted_value" in body
+    assert b"org-key" in body or b'"key_id":"org-key"' in body or b'"key_id": "org-key"' in body
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_organization_variable_create() -> None:
+    from secretsync.domain.models import ValueKind
+
+    route = respx.post("https://api.github.com/orgs/acme/actions/variables").mock(
+        return_value=httpx.Response(201)
+    )
+    dest = GitHubActionsFactory().create(_services())
+    result = await dest.apply(
+        ApplyDestinationRequest(
+            deployment_id="dep",
+            destination_config={
+                "connector": "github-actions",
+                "repository": "acme/web",
+                "auth": {"tokenEnv": "GITHUB_TOKEN"},
+            },
+            mutations=[
+                PutMutation(
+                    mutation_id="dep:LOG_LEVEL",
+                    name="LOG_LEVEL",
+                    value=bytearray(b"info"),
+                    scopes=({"kind": "organization", "visibility": "all"},),
+                    kind=ValueKind.VARIABLE,
+                )
+            ],
+        ),
+        OperationContext(correlation_id="c1"),
+    )
+    assert route.called
+    assert result.results[0].status == "applied"
+    assert result.results[0].effect == "created"
+    body = route.calls[0].request.read()
+    assert b'"visibility":"all"' in body or b'"visibility": "all"' in body
+    assert b"LOG_LEVEL" in body
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_list_organization_secret_names() -> None:
+    respx.get("https://api.github.com/orgs/acme/actions/secrets").mock(
+        return_value=httpx.Response(
+            200,
+            json={"total_count": 1, "secrets": [{"name": "ORG_SECRET"}]},
+        )
+    )
+    dest = GitHubActionsFactory().create(_services())
+    names = await dest.list_names(
+        {
+            "connector": "github-actions",
+            "repository": "acme/web",
+            "auth": {"tokenEnv": "GITHUB_TOKEN"},
+        },
+        {"kind": "organization"},
+        OperationContext(correlation_id="c1"),
+    )
+    assert names == frozenset({"ORG_SECRET"})
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_list_organization_variable_names() -> None:
+    from secretsync.domain.models import ValueKind
+
+    respx.get("https://api.github.com/orgs/acme/actions/variables").mock(
+        return_value=httpx.Response(
+            200,
+            json={"total_count": 1, "variables": [{"name": "LOG_LEVEL", "value": "info"}]},
+        )
+    )
+    dest = GitHubActionsFactory().create(_services())
+    names = await dest.list_names(
+        {
+            "connector": "github-actions",
+            "repository": "acme/web",
+            "auth": {"tokenEnv": "GITHUB_TOKEN"},
+        },
+        {"kind": "organization"},
+        OperationContext(correlation_id="c1"),
+        kind=ValueKind.VARIABLE,
+    )
+    assert names == frozenset({"LOG_LEVEL"})
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_delete_organization_secret() -> None:
+    from secretsync.destinations.base import DeleteMutation
+
+    route = respx.delete("https://api.github.com/orgs/acme/actions/secrets/ORPHAN").mock(
+        return_value=httpx.Response(204)
+    )
+    dest = GitHubActionsFactory().create(_services())
+    result = await dest.apply(
+        ApplyDestinationRequest(
+            deployment_id="dep",
+            destination_config={
+                "connector": "github-actions",
+                "repository": "acme/web",
+                "auth": {"tokenEnv": "GITHUB_TOKEN"},
+            },
+            mutations=[],
+            deletes=[
+                DeleteMutation(
+                    mutation_id="dep:delete:ORPHAN",
+                    name="ORPHAN",
+                    scopes=({"kind": "organization"},),
+                )
+            ],
+        ),
+        OperationContext(correlation_id="c1"),
+    )
+    assert route.called
+    assert result.results[0].status == "applied"
+    assert result.results[0].effect == "deleted"
+
+
+@pytest.mark.asyncio
+async def test_organization_selected_requires_repository_ids() -> None:
+    dest = GitHubActionsFactory().create(_services())
+    result = await dest.apply(
+        ApplyDestinationRequest(
+            deployment_id="dep",
+            destination_config={
+                "connector": "github-actions",
+                "repository": "acme/web",
+                "auth": {"tokenEnv": "GITHUB_TOKEN"},
+            },
+            mutations=[_mutation("A", kind="organization", visibility="selected")],
         ),
         OperationContext(correlation_id="c1"),
     )
     assert result.results[0].status == "failed"
     assert result.results[0].error is not None
-    assert "Organization" in result.results[0].error.message
+    assert "selected_repository_ids" in result.results[0].error.message
+
+
+@pytest.mark.asyncio
+async def test_organization_invalid_visibility() -> None:
+    dest = GitHubActionsFactory().create(_services())
+    result = await dest.apply(
+        ApplyDestinationRequest(
+            deployment_id="dep",
+            destination_config={
+                "connector": "github-actions",
+                "repository": "acme/web",
+                "auth": {"tokenEnv": "GITHUB_TOKEN"},
+            },
+            mutations=[_mutation("A", kind="organization", visibility="nope")],
+        ),
+        OperationContext(correlation_id="c1"),
+    )
+    assert result.results[0].status == "failed"
+    assert result.results[0].error is not None
+    assert "visibility" in result.results[0].error.message
 
 
 def test_encrypt_roundtrip_shape() -> None:
@@ -486,3 +663,34 @@ async def test_org_only_destination_rejects_repo_scope_apply() -> None:
     assert result.results[0].status == "failed"
     assert result.results[0].error is not None
     assert "no repository" in result.results[0].error.message
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_org_only_destination_allows_organization_scope() -> None:
+    from nacl import encoding
+
+    key = public.PrivateKey.generate().public_key
+    key_b64 = key.encode(encoder=encoding.Base64Encoder).decode()
+    respx.get("https://api.github.com/orgs/acme/actions/secrets/public-key").mock(
+        return_value=httpx.Response(200, json={"key_id": "org-key", "key": key_b64})
+    )
+    put = respx.put("https://api.github.com/orgs/acme/actions/secrets/ORG_SECRET").mock(
+        return_value=httpx.Response(201)
+    )
+    dest = GitHubActionsFactory().create(_services())
+    result = await dest.apply(
+        ApplyDestinationRequest(
+            deployment_id="dep",
+            destination_config={
+                "connector": "github-actions",
+                "organization": "acme",
+                "auth": {"tokenEnv": "GITHUB_TOKEN"},
+            },
+            mutations=[_mutation("ORG_SECRET", kind="organization")],
+        ),
+        OperationContext(correlation_id="c1"),
+    )
+    assert put.called
+    assert result.results[0].status == "applied"
+    assert result.results[0].effect == "created"
