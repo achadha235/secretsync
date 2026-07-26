@@ -273,6 +273,7 @@ def _validate_github_deployment(deployment: DeploymentDefinition) -> None:
             ),
         )
 
+
 def _record_target(
     seen_targets: set[tuple[str, str, str, str]],
     deployment: DeploymentDefinition,
