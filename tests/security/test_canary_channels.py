@@ -120,9 +120,16 @@ async def test_canary_http_error_bodies() -> None:
         response = await request_with_retries(client, "GET", "https://example.test/secret")
     assert route.called
     assert response.status_code == 403
-    # Body must never be pulled into SafeError helpers — only status mapping
     from secretsync.infrastructure.http import error_for_status
 
+    # Status-only mapping stays value-free.
     err = error_for_status(403, correlation_id="c1")
     assert_canary_absent(err.message, label="http safe error")
     assert CANARY not in (err.hint or "")
+
+    # Provider body may be included when redacting known secrets.
+    err_with_body = error_for_status(response, correlation_id="c1", secrets=[CANARY])
+    assert_canary_absent(err_with_body.message, label="http safe error with body")
+    assert "Provider rejected authorization (HTTP 403)" in err_with_body.message
+    assert "denied" in err_with_body.message
+    assert "***" in err_with_body.message

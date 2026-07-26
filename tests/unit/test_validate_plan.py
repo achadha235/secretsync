@@ -28,6 +28,12 @@ def test_unknown_secret_in_deployment() -> None:
     result = validate_config(services, fixture_path("unknown_secret.yaml"))
     assert not result.ok
     assert result.issues[0].code == "CONFIG_INVALID"
+    message = result.issues[0].message
+    assert "missingSecret" in message
+    assert "set 's'" in message
+    assert "deployment 'd1'" in message
+    assert "destination 'github'" in message
+    assert result.issues[0].hint is not None
 
 
 def test_duplicate_target_rejected() -> None:
@@ -147,6 +153,27 @@ def test_vercel_environment_requires_project_offline() -> None:
     result = validate_config(services, fixture_path("vercel_environment_missing_project.yaml"))
     assert not result.ok
     assert "project" in result.issues[0].message.lower() or "project" in result.issues[0].message
+
+
+def test_github_org_rejects_invalid_visibility_offline() -> None:
+    services = create_services({"API_KEY": "x", "GITHUB_TOKEN": "t"})
+    result = validate_config(services, fixture_path("github_org_invalid_visibility.yaml"))
+    assert not result.ok
+    assert "visibility" in result.issues[0].message
+
+
+def test_github_org_requires_visibility_offline() -> None:
+    services = create_services({"API_KEY": "x", "GITHUB_TOKEN": "t"})
+    result = validate_config(services, fixture_path("github_org_missing_visibility.yaml"))
+    assert not result.ok
+    assert "visibility" in result.issues[0].message
+
+
+def test_github_org_selected_requires_repository_ids_offline() -> None:
+    services = create_services({"API_KEY": "x", "GITHUB_TOKEN": "t"})
+    result = validate_config(services, fixture_path("github_org_selected_missing_ids.yaml"))
+    assert not result.ok
+    assert "selectedRepositoryIds" in result.issues[0].message
 
 
 def test_mixed_variables_plan_emits_kinds() -> None:

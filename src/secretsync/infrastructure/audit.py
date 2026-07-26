@@ -119,6 +119,8 @@ def record_mutation_audit(
     effect: str | None,
     correlation_id: str,
     error_code: str | None = None,
+    error_message: str | None = None,
+    error_hint: str | None = None,
     cwd: Path | None = None,
 ) -> Path:
     """Append one value-free per-secret mutation line."""
@@ -142,8 +144,18 @@ def record_mutation_audit(
         f"correlation={correlation_id}",
         f"error={error_code or '-'}",
     ]
+    if error_message:
+        parts.append(f"error_message={_audit_quote(error_message)}")
+    if error_hint:
+        parts.append(f"error_hint={_audit_quote(error_hint)}")
     _append_line(audit_path, " ".join(parts))
     return audit_path
+
+
+def _audit_quote(value: str) -> str:
+    """Quote audit field values that may contain spaces or newlines."""
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+    return f'"{escaped}"'
 
 
 def _append_line(audit_path: Path, line: str) -> None:

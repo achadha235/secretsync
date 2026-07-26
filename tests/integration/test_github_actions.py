@@ -30,7 +30,7 @@ def _mutation(
     if visibility is not None:
         scope["visibility"] = visibility
     if selected_repository_ids is not None:
-        scope["selected_repository_ids"] = selected_repository_ids
+        scope["selectedRepositoryIds"] = selected_repository_ids
     return PutMutation(
         mutation_id=f"dep:{name}",
         name=name,
@@ -321,7 +321,7 @@ async def test_organization_selected_requires_repository_ids() -> None:
     )
     assert result.results[0].status == "failed"
     assert result.results[0].error is not None
-    assert "selected_repository_ids" in result.results[0].error.message
+    assert "selectedRepositoryIds" in result.results[0].error.message
 
 
 @pytest.mark.asyncio

@@ -65,6 +65,8 @@ With `--prune` on `plan` / `apply` (or the TUI prune checkbox):
 
 There is no local last-applied state file — every prune plan reflects the live remote inventory. Auth/list failures fail the plan; they are not skipped. Connectors without `list_names` + delete support refuse prune with a clear error.
 
+Vercel ownership is exact target-set equality (`scope.targets` == remote `target`), for both `environment` and `shared-environment`. Overlap matching would let a multi-target inventory unit prune sibling single-target rows.
+
 ## Connector boundary
 
 Connectors own batching and provider adaptation. The coordinator groups mutations by destination and deployment, then calls `apply` with `PutMutation` values and optional `DeleteMutation`s. Each mutation must receive exactly one result (`applied` / `failed` / `skipped`).
@@ -107,7 +109,7 @@ See security tests: [`tests/security/test_envfile_pipe.py`](../tests/security/te
 
 ## HTTP client
 
-[`infrastructure/http.py`](../src/secretsync/infrastructure/http.py) wraps httpx with bounded retries (429/502/503/504), no wire body logging, and `redact_headers` / `response_debug_meta` for safe diagnostics. Errors map to `SafeConnectorError` codes without provider body text.
+[`infrastructure/http.py`](../src/secretsync/infrastructure/http.py) wraps httpx with bounded retries (429/502/503/504), no Authorization wire logging, and `redact_headers` / `response_debug_meta` for safe diagnostics. HTTP failures map to `SafeConnectorError` with a bounded, secret-redacted provider error detail (also logged at DEBUG and written to the mutation audit line).
 
 ## Errors and reports
 

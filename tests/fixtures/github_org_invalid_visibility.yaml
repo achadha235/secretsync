@@ -1,0 +1,23 @@
+version: 1
+changeDetection: always-write
+secrets:
+  apiKey:
+    env: API_KEY
+sets:
+  production:
+    include: [apiKey]
+destinations:
+  github:
+    connector: github-actions
+    organization: acme
+    auth:
+      tokenEnv: GITHUB_TOKEN
+deployments:
+  - name: github-org
+    set: production
+    destination: github
+    scope:
+      kind: organization
+      visibility: public
+    secrets:
+      apiKey: API_KEY

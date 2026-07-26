@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import anyio
+from loguru import logger
 
 from secretsync.application.plan import build_plan_async
 from secretsync.application.services import AppServices
@@ -135,8 +136,6 @@ async def run_apply_async(
     run_id: str | None = None,
 ) -> ApplyReport:
     """Async apply entry used by the Textual TUI workers."""
-    from loguru import logger
-
     started = services.clock.now()
     validation = validate_config(
         services,
@@ -513,6 +512,15 @@ def _audit_mutations(
     for mutation in request.mutations:
         result = by_id[mutation.mutation_id]
         scope = mutation.scopes[0] if mutation.scopes else {}
+        if result.status == "failed" and result.error is not None:
+            logger.debug(
+                "mutation failed dest={} name={} [{}] {}{}",
+                destination_id,
+                mutation.name,
+                result.error.code,
+                result.error.message,
+                f" hint={result.error.hint}" if result.error.hint else "",
+            )
         record_mutation_audit(
             config_path=config_path,
             run_id=run_id,
@@ -526,10 +534,21 @@ def _audit_mutations(
             effect=result.effect,
             correlation_id=correlation_id,
             error_code=result.error.code if result.error else None,
+            error_message=result.error.message if result.error else None,
+            error_hint=result.error.hint if result.error else None,
         )
     for deletion in request.deletes:
         result = by_id[deletion.mutation_id]
         scope = deletion.scopes[0] if deletion.scopes else {}
+        if result.status == "failed" and result.error is not None:
+            logger.debug(
+                "mutation failed dest={} name={} [{}] {}{}",
+                destination_id,
+                deletion.name,
+                result.error.code,
+                result.error.message,
+                f" hint={result.error.hint}" if result.error.hint else "",
+            )
         record_mutation_audit(
             config_path=config_path,
             run_id=run_id,
@@ -543,6 +562,8 @@ def _audit_mutations(
             effect=result.effect,
             correlation_id=correlation_id,
             error_code=result.error.code if result.error else None,
+            error_message=result.error.message if result.error else None,
+            error_hint=result.error.hint if result.error else None,
         )
 
 

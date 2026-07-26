@@ -15,12 +15,30 @@ class ComposedSet:
         self._members = members
         self.order: tuple[str, ...] = tuple(members.keys())
 
-    def require(self, logical_id: str) -> SecretRef:
+    def require(
+        self,
+        logical_id: str,
+        *,
+        deployment: str | None = None,
+        destination: str | None = None,
+    ) -> SecretRef:
         try:
             return self._members[logical_id]
         except KeyError as exc:
+            where = ""
+            if deployment is not None:
+                where = f" (deployment '{deployment}'"
+                if destination is not None:
+                    where += f", destination '{destination}'"
+                where += ")"
             raise ConfigInvalidError(
-                f"Logical id '{logical_id}' is not available in set '{self.set_id}'"
+                f"Logical id '{logical_id}' is not available in set '{self.set_id}'{where}",
+                hint=(
+                    f"Add '{logical_id}' to set '{self.set_id}' (or an ancestor), "
+                    f"or point the deployment at a set that includes it."
+                    if deployment is not None
+                    else None
+                ),
             ) from exc
 
     def get(self, logical_id: str) -> SecretRef | None:

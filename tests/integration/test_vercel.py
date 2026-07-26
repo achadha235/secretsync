@@ -443,6 +443,7 @@ async def test_conflict_edit_fallback() -> None:
 @pytest.mark.asyncio
 @respx.mock
 async def test_list_names_filters_by_targets() -> None:
+    """Exact target-set match: multi-target remotes are not owned by single-target scopes."""
     respx.get("https://api.vercel.com/v9/projects/web/env").mock(
         return_value=httpx.Response(
             200,
@@ -467,7 +468,132 @@ async def test_list_names_filters_by_targets() -> None:
         OperationContext(correlation_id="c1"),
         kind=ValueKind.VARIABLE,
     )
-    assert names == frozenset({"KEEP", "BOTH"})
+    assert names == frozenset({"KEEP"})
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_shared_list_exact_targets_partition() -> None:
+    """Three-way target partition: common must not list production- or preview-only rows."""
+    respx.get("https://api.vercel.com/v1/env").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "id": "1",
+                        "key": "SECRET_THREE_ORG",
+                        "type": "sensitive",
+                        "target": ["production"],
+                        "projectId": [],
+                    },
+                    {
+                        "id": "2",
+                        "key": "SECRET_THREE_ORG",
+                        "type": "sensitive",
+                        "target": ["preview"],
+                        "projectId": [],
+                    },
+                    {
+                        "id": "3",
+                        "key": "SECRET_TWO",
+                        "type": "sensitive",
+                        "target": ["production", "preview"],
+                        "projectId": [],
+                    },
+                    {
+                        "id": "4",
+                        "key": "LOG_LEVEL",
+                        "type": "encrypted",
+                        "target": ["preview"],
+                        "projectId": [],
+                    },
+                    {
+                        "id": "5",
+                        "key": "ORG_NAME",
+                        "type": "encrypted",
+                        "target": ["production", "preview"],
+                        "projectId": [],
+                    },
+                ],
+                "pagination": {"count": 5, "next": None, "prev": None},
+            },
+        )
+    )
+    dest = VercelFactory().create(_services())
+    common_secrets = await dest.list_names(
+        _dest_config(),  # type: ignore[arg-type]
+        {"kind": "shared-environment", "targets": ["production", "preview"]},  # type: ignore[arg-type]
+        OperationContext(correlation_id="c1"),
+        kind=ValueKind.SECRET,
+    )
+    preview_secrets = await dest.list_names(
+        _dest_config(),  # type: ignore[arg-type]
+        {"kind": "shared-environment", "targets": ["preview"]},  # type: ignore[arg-type]
+        OperationContext(correlation_id="c1"),
+        kind=ValueKind.SECRET,
+    )
+    preview_vars = await dest.list_names(
+        _dest_config(),  # type: ignore[arg-type]
+        {"kind": "shared-environment", "targets": ["preview"]},  # type: ignore[arg-type]
+        OperationContext(correlation_id="c1"),
+        kind=ValueKind.VARIABLE,
+    )
+    assert common_secrets == frozenset({"SECRET_TWO"})
+    assert preview_secrets == frozenset({"SECRET_THREE_ORG"})
+    assert preview_vars == frozenset({"LOG_LEVEL"})
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_shared_upsert_exact_targets_creates_when_overlap_only() -> None:
+    """Preview-only put must create, not patch a production-only row with the same key."""
+    respx.get("https://api.vercel.com/v1/env").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "id": "env_prod",
+                        "key": "SECRET_THREE_ORG",
+                        "type": "sensitive",
+                        "target": ["production"],
+                        "projectId": [],
+                    }
+                ],
+                "pagination": {"count": 1, "next": None, "prev": None},
+            },
+        )
+    )
+    create = respx.post("https://api.vercel.com/v1/env").mock(
+        return_value=httpx.Response(201, json={"created": [], "failed": []})
+    )
+    patch = respx.patch("https://api.vercel.com/v1/env").mock(
+        return_value=httpx.Response(200, json={"updated": [], "failed": []})
+    )
+    dest = VercelFactory().create(_services())
+    result = await dest.apply(
+        ApplyDestinationRequest(
+            deployment_id="preview",
+            destination_config=_dest_config(),  # type: ignore[arg-type]
+            mutations=[
+                _mutation(
+                    "SECRET_THREE_ORG",
+                    scope_kind="shared-environment",
+                    targets=["preview"],
+                    value=b"staging-value",
+                )
+            ],
+        ),
+        OperationContext(correlation_id="c1"),
+    )
+    assert result.results[0].status == "applied"
+    assert result.results[0].effect == "upserted"
+    assert create.called
+    assert not patch.called
+    body = json.loads(create.calls[0].request.read())
+    assert body["target"] == ["preview"]
+    assert body["evs"][0]["key"] == "SECRET_THREE_ORG"
 
 
 @pytest.mark.asyncio
@@ -620,6 +746,53 @@ async def test_shared_patch_existing() -> None:
     assert "env_shared_1" in body["updates"]
     assert body["updates"]["env_shared_1"]["value"] == "rotated"
     assert body["updates"]["env_shared_1"]["projectId"] == ["prj_a", "prj_b"]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_shared_patch_omits_empty_projects() -> None:
+    respx.get("https://api.vercel.com/v1/env").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "id": "env_unlinked",
+                        "key": "SECRET_TWO",
+                        "type": "sensitive",
+                        "target": ["production", "preview"],
+                        "projectId": [],
+                    }
+                ],
+                "pagination": {"count": 1, "next": None, "prev": None},
+            },
+        )
+    )
+    patch = respx.patch("https://api.vercel.com/v1/env").mock(
+        return_value=httpx.Response(200, json={"updated": [], "failed": []})
+    )
+    dest = VercelFactory().create(_services())
+    result = await dest.apply(
+        ApplyDestinationRequest(
+            deployment_id="common",
+            destination_config=_dest_config(),  # type: ignore[arg-type]
+            mutations=[
+                _mutation(
+                    "SECRET_TWO",
+                    scope_kind="shared-environment",
+                    targets=["production", "preview"],
+                    value=b"rotated",
+                )
+            ],
+        ),
+        OperationContext(correlation_id="c1"),
+    )
+    assert result.results[0].status == "applied"
+    assert result.results[0].effect == "updated"
+    assert patch.called
+    body = json.loads(patch.calls[0].request.read())
+    assert "env_unlinked" in body["updates"]
+    assert "projectId" not in body["updates"]["env_unlinked"]
 
 
 @pytest.mark.asyncio

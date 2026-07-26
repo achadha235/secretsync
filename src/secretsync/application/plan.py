@@ -60,7 +60,11 @@ def build_plan(
     for deployment in selected:
         available = composed_sets[deployment.set]
         for logical_id, destination_name in deployment.secrets.items():
-            source = available.require(logical_id)
+            source = available.require(
+                logical_id,
+                deployment=deployment.name,
+                destination=deployment.destination,
+            )
             puts.append(
                 PlannedPut(
                     mutation_id=stable_mutation_id(deployment.name, destination_name),
@@ -70,7 +74,11 @@ def build_plan(
                 )
             )
         for logical_id, destination_name in deployment.variables.items():
-            source = available.require(logical_id)
+            source = available.require(
+                logical_id,
+                deployment=deployment.name,
+                destination=deployment.destination,
+            )
             puts.append(
                 PlannedPut(
                     mutation_id=stable_mutation_id(deployment.name, destination_name),

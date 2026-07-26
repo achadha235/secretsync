@@ -156,6 +156,11 @@ def _targets_and_type_match(
     *,
     kind: ValueKind,
 ) -> bool:
+    """True when remote target set equals scope.targets (exact ownership).
+
+    Overlap matching is wrong: a shared deployment with targets [production, preview]
+    must not own (list/update/prune) rows that only target production or only preview.
+    """
     targets_raw = scope.get("targets")
     if not isinstance(targets_raw, list):
         return False
@@ -164,7 +169,7 @@ def _targets_and_type_match(
     if not isinstance(remote_targets, list):
         return False
     remote = {str(t) for t in remote_targets}
-    if not wanted.intersection(remote):
+    if wanted != remote:
         return False
     remote_type = str(item.get("type", ""))
     if kind is ValueKind.SECRET:
@@ -524,7 +529,11 @@ class VercelDestination:
             )
             return edited, 1 + n
 
-        err = error_for_status(response.status_code, correlation_id=correlation_id)
+        err = error_for_status(
+            response,
+            correlation_id=correlation_id,
+            secrets=[bytes(m.value).decode("utf-8", errors="replace") for m in mutations],
+        )
         return (
             {
                 m.mutation_id: MutationResult(
@@ -557,9 +566,7 @@ class VercelDestination:
             client, "GET", list_url, params=params, correlation_id=correlation_id
         )
         if listed.status_code != 200:
-            raise ListNamesError(
-                error_for_status(listed.status_code, correlation_id=correlation_id)
-            )
+            raise ListNamesError(error_for_status(listed, correlation_id=correlation_id))
         return _parse_env_list(listed.json()), 1
 
     async def _list_shared_envs(
@@ -582,9 +589,7 @@ class VercelDestination:
             )
             requests += 1
             if listed.status_code != 200:
-                raise ListNamesError(
-                    error_for_status(listed.status_code, correlation_id=correlation_id)
-                )
+                raise ListNamesError(error_for_status(listed, correlation_id=correlation_id))
             page, next_ts = _parse_shared_env_page(listed.json())
             items.extend(page)
             if next_ts is None:
@@ -750,7 +755,11 @@ class VercelDestination:
                 },
                 1,
             )
-        err = error_for_status(response.status_code, correlation_id=correlation_id)
+        err = error_for_status(
+            response,
+            correlation_id=correlation_id,
+            secrets=[bytes(m.value).decode("utf-8", errors="replace") for m in mutations],
+        )
         return (
             {
                 m.mutation_id: MutationResult(
@@ -786,8 +795,10 @@ class VercelDestination:
                 "value": bytes(mutation.value).decode("utf-8"),
                 "type": _env_type(mutation.kind),
                 "target": [str(t) for t in targets_raw],
-                "projectId": sorted(_scope_projects(scope)),
             }
+            projects = sorted(_scope_projects(scope))
+            if projects:
+                entry["projectId"] = projects
             payload_updates[env_id] = entry
         url = f"{VERCEL_API}{SHARED_ENV_PATH}"
         params = {"teamId": team_id}
@@ -830,7 +841,11 @@ class VercelDestination:
                 },
                 1,
             )
-        err = error_for_status(response.status_code, correlation_id=correlation_id)
+        err = error_for_status(
+            response,
+            correlation_id=correlation_id,
+            secrets=[bytes(m.value).decode("utf-8", errors="replace") for m, _ in updates],
+        )
         return (
             {
                 m.mutation_id: MutationResult(
@@ -938,7 +953,7 @@ class VercelDestination:
                         effect="deleted",
                     )
             else:
-                err = error_for_status(response.status_code, correlation_id=correlation_id)
+                err = error_for_status(response, correlation_id=correlation_id)
                 for deletion, _ in chunk:
                     results[deletion.mutation_id] = MutationResult(
                         mutation_id=deletion.mutation_id,
@@ -1042,7 +1057,7 @@ class VercelDestination:
                     mutation_id=deletion.mutation_id,
                     status="failed",
                     error=error_for_status(
-                        response.status_code,
+                        response,
                         mutation_id=deletion.mutation_id,
                         correlation_id=correlation_id,
                     ),
@@ -1160,9 +1175,10 @@ class VercelDestination:
                     mutation_id=mutation.mutation_id,
                     status="failed",
                     error=error_for_status(
-                        edited.status_code,
+                        edited,
                         mutation_id=mutation.mutation_id,
                         correlation_id=correlation_id,
+                        secrets=[bytes(mutation.value).decode("utf-8", errors="replace")],
                     ),
                 )
         return results, requests

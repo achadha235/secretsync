@@ -83,6 +83,8 @@ def render_apply_human(report: ApplyReport) -> str:
             if result.error is not None:
                 line += f" [{result.error.code}] {result.error.message}"
             lines.append(line)
+            if result.error is not None and result.error.hint:
+                lines.append(f"    hint: {result.error.hint}")
     if report.cancelled:
         lines.append("Interrupted: completed writes were not rolled back.")
     return "\n".join(lines)

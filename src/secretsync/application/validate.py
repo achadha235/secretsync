@@ -62,6 +62,9 @@ def validate_config(
             destinations=destinations,
         )
     except SecretSyncError as exc:
+        logger.error("{}", exc.safe.message)
+        if exc.safe.hint:
+            logger.error("hint: {}", exc.safe.hint)
         return ValidationResult(
             issues=[ValidationIssue(code=exc.code, message=exc.safe.message, hint=exc.safe.hint)],
             exit_code=exit_code_for(exc),
@@ -93,6 +96,9 @@ def validate_loaded(
             selected_deployments=tuple(d.name for d in selected),
         )
     except SecretSyncError as exc:
+        logger.error("{}", exc.safe.message)
+        if exc.safe.hint:
+            logger.error("hint: {}", exc.safe.hint)
         return ValidationResult(
             issues=[ValidationIssue(code=exc.code, message=exc.safe.message, hint=exc.safe.hint)],
             exit_code=exit_code_for(exc),
@@ -134,12 +140,18 @@ def _validate_deployments(
 
         if destination.connector == "vercel":
             _validate_vercel_deployment(deployment, destination)
+        elif destination.connector == "github-actions":
+            _validate_github_deployment(deployment)
 
         available = composed[deployment.set]
         kinds_used: set[ValueKind] = set()
 
         for logical_id, dest_name in deployment.secrets.items():
-            ref = available.require(logical_id)
+            ref = available.require(
+                logical_id,
+                deployment=deployment.name,
+                destination=deployment.destination,
+            )
             if ref.kind is not ValueKind.SECRET:
                 raise ConfigInvalidError(
                     f"Deployment '{deployment.name}' maps '{logical_id}' under secrets, "
@@ -158,7 +170,11 @@ def _validate_deployments(
             )
 
         for logical_id, dest_name in deployment.variables.items():
-            ref = available.require(logical_id)
+            ref = available.require(
+                logical_id,
+                deployment=deployment.name,
+                destination=deployment.destination,
+            )
             if ref.kind is not ValueKind.VARIABLE:
                 raise ConfigInvalidError(
                     f"Deployment '{deployment.name}' maps '{logical_id}' under variables, "
@@ -234,6 +250,21 @@ def _validate_vercel_deployment(deployment: DeploymentDefinition, destination: o
             )
 
 
+def _validate_github_deployment(deployment: DeploymentDefinition) -> None:
+    from secretsync.destinations.github_actions import _validate_scope
+
+    reason = _validate_scope(deployment.scope)
+    if reason:
+        raise ConfigInvalidError(
+            f"Deployment '{deployment.name}' has invalid GitHub scope: {reason}",
+            hint=(
+                "Use scope.kind: repository | environment | organization. "
+                "For organization, set visibility: all|private|selected "
+                "(selected requires selectedRepositoryIds)."
+            ),
+        )
+
+
 def _record_target(
     seen_targets: set[tuple[str, str, str, str]],
     deployment: DeploymentDefinition,
@@ -267,7 +298,11 @@ def _check_environment_presence(
     for deployment in selected:
         available = composed[deployment.set]
         for logical_id in (*deployment.secrets, *deployment.variables):
-            ref = available.require(logical_id)
+            ref = available.require(
+                logical_id,
+                deployment=deployment.name,
+                destination=deployment.destination,
+            )
             required_source.add(ref.env_name)
 
         destination = config.destinations[deployment.destination]
