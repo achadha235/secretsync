@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from importlib.metadata import version
 
 from click.testing import CliRunner
 
@@ -20,6 +21,13 @@ def test_help() -> None:
     assert result.exit_code == 0
     assert "validate" in result.output
     assert "plan" in result.output
+
+
+def test_version() -> None:
+    runner = CliRunner()
+    result = runner.invoke(cli, ["version"])
+    assert result.exit_code == 0
+    assert result.output == f"{version('secretsync-cli')}\n"
 
 
 def test_validate_cli_ok() -> None:

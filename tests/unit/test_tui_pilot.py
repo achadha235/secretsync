@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from secretsync import __version__
 from secretsync.application.services import create_services
 from secretsync.presentation.json import apply_to_dict, render_apply_json
 from secretsync.tui.app import SecretSyncApp
@@ -31,6 +32,11 @@ def _screen_text(app: SecretSyncApp) -> str:
         if hasattr(node, "renderable"):
             parts.append(str(node.renderable))
     return "\n".join(parts)
+
+
+def test_tui_shows_package_version_in_subtitle() -> None:
+    expected = f"v{__version__}"
+    assert expected == SecretSyncApp.SUB_TITLE
 
 
 @pytest.mark.asyncio
