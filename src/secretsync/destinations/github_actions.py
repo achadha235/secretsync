@@ -33,11 +33,28 @@ from secretsync.infrastructure.redaction import scrub_bytearray
 
 GITHUB_API = "https://api.github.com"
 SECRET_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-REPO_RE = re.compile(r"^[^/\s]+/[^/\s]+$")
+OWNER_REPO_RE = re.compile(r"^[^/\s]+/[^/\s]+$")
+SEGMENT_RE = re.compile(r"^[^/\s]+$")
 VARIABLE_NAME_RE = SECRET_NAME_RE
+# Backward-compatible alias used by older tests / callers.
+REPO_RE = OWNER_REPO_RE
 ORG_VISIBILITIES = frozenset({"all", "private", "selected"})
 VALID_SCOPE_KINDS = frozenset({"repository", "environment", "organization"})
 SCOPE_KIND_MESSAGE = "Invalid GitHub scope; require kind repository|environment|organization"
+
+
+@dataclass(frozen=True, slots=True)
+class GitHubRepoRef:
+    """Resolved GitHub owner + optional repository name."""
+
+    owner: str
+    repository: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ConfigParseError:
+    message: str
+    hint: str | None = None
 
 
 def _capabilities() -> DestinationCapabilities:
@@ -59,12 +76,149 @@ def encrypt_github_secret(public_key_b64: str, secret_value: bytes) -> str:
     return base64.b64encode(sealed).decode("utf-8")
 
 
+def _parse_github_target(
+    config: Mapping[str, JsonValue],
+) -> GitHubRepoRef | _ConfigParseError:
+    """Resolve destination organization/repository into an owner (+ optional repo).
+
+    Allowed:
+      - organization: org
+      - organization: org + repository: name  (name must not contain '/')
+      - repository: owner/name               (no organization field)
+
+    Rejected:
+      - organization + repository: owner/name (redundant or mismatched)
+      - repository: name without organization
+      - neither field set
+    """
+    raw_org = config.get("organization")
+    raw_repo = config.get("repository")
+
+    org: str | None = None
+    if raw_org is not None:
+        if not isinstance(raw_org, str) or not raw_org.strip():
+            return _ConfigParseError(
+                message="github-actions organization must be a non-empty string",
+                hint="Example: organization: my-org",
+            )
+        org = raw_org.strip()
+        if not SEGMENT_RE.match(org):
+            return _ConfigParseError(
+                message=(
+                    f"github-actions organization {org!r} must be a single path segment (no '/')"
+                ),
+                hint="Use organization: my-org — not an owner/repo string.",
+            )
+
+    repo: str | None = None
+    if raw_repo is not None:
+        if not isinstance(raw_repo, str) or not raw_repo.strip():
+            return _ConfigParseError(
+                message="github-actions repository must be a non-empty string",
+                hint="Use repository: owner/name, or organization: + repository: name.",
+            )
+        repo = raw_repo.strip()
+
+    if org is None and repo is None:
+        return _ConfigParseError(
+            message="github-actions requires organization and/or repository",
+            hint=(
+                "Set organization: my-org, or repository: owner/name, "
+                "or both as organization: my-org and repository: my-repo."
+            ),
+        )
+
+    if org is not None and repo is None:
+        return GitHubRepoRef(owner=org, repository=None)
+
+    assert repo is not None
+
+    if org is not None:
+        if "/" in repo:
+            if OWNER_REPO_RE.match(repo):
+                owner, _name = repo.split("/", 1)
+                if owner == org:
+                    return _ConfigParseError(
+                        message=(
+                            "github-actions must not set organization together with "
+                            "repository as 'owner/name'"
+                        ),
+                        hint=(
+                            f"Use repository: {_name!r} with organization: {org!r}, "
+                            f"or drop organization and keep repository: {repo!r}."
+                        ),
+                    )
+                return _ConfigParseError(
+                    message=(
+                        f"github-actions organization {org!r} does not match "
+                        f"repository owner {owner!r} in {repo!r}"
+                    ),
+                    hint=(
+                        f"Use organization: {owner!r} with repository: "
+                        f"{repo.split('/', 1)[1]!r}, or repository: {repo!r} alone."
+                    ),
+                )
+            return _ConfigParseError(
+                message=f"github-actions repository {repo!r} is invalid",
+                hint="With organization set, repository must be a bare repo name (no '/').",
+            )
+        if not SEGMENT_RE.match(repo):
+            return _ConfigParseError(
+                message=f"github-actions repository {repo!r} is invalid",
+                hint="With organization set, repository must be a bare repo name (no '/').",
+            )
+        return GitHubRepoRef(owner=org, repository=repo)
+
+    # repository alone — must be owner/name
+    if not OWNER_REPO_RE.match(repo):
+        return _ConfigParseError(
+            message=(
+                f"github-actions repository {repo!r} must be 'owner/name' "
+                "when organization is omitted"
+            ),
+            hint=("Use repository: owner/name, or set organization: owner and repository: name."),
+        )
+    owner, name = repo.split("/", 1)
+    return GitHubRepoRef(owner=owner, repository=name)
+
+
 def _parse_repository(config: Mapping[str, JsonValue]) -> tuple[str, str] | None:
-    raw = config.get("repository")
-    if not isinstance(raw, str) or not REPO_RE.match(raw):
+    """Return (owner, repo) when the destination resolves to a concrete repository."""
+    parsed = _parse_github_target(config)
+    if isinstance(parsed, _ConfigParseError) or parsed.repository is None:
         return None
-    owner, repo = raw.split("/", 1)
-    return owner, repo
+    return parsed.owner, parsed.repository
+
+
+def _require_repo_ref(
+    config: Mapping[str, JsonValue],
+) -> tuple[str, str] | _ConfigParseError:
+    """Like _parse_github_target, but require a concrete repository for repo/env ops."""
+    parsed = _parse_github_target(config)
+    if isinstance(parsed, _ConfigParseError):
+        return parsed
+    return _owner_repo_for_scope(parsed, {"kind": "repository"})
+
+
+def _owner_repo_for_scope(
+    parsed: GitHubRepoRef,
+    scope: Mapping[str, JsonValue],
+) -> tuple[str, str] | _ConfigParseError:
+    """Resolve owner/repo for a scope. Organization scope needs owner only."""
+    if scope.get("kind") == "organization":
+        return parsed.owner, parsed.repository or ""
+    if parsed.repository is None:
+        return _ConfigParseError(
+            message=(
+                f"github-actions destination has organization {parsed.owner!r} "
+                "but no repository; repository/environment scopes require a repository"
+            ),
+            hint=(
+                f"Add repository: <repo-name> under the destination, or use "
+                f"repository: {parsed.owner}/<repo-name>."
+            ),
+        )
+    return parsed.owner, parsed.repository
 
 
 def _token_env(config: Mapping[str, JsonValue]) -> str | None:
@@ -138,11 +292,13 @@ class GitHubActionsDestination:
 
     async def validate(self, config: Mapping[str, JsonValue]) -> list[Issue]:
         issues: list[Issue] = []
-        if _parse_repository(config) is None:
+        parsed = _parse_github_target(config)
+        if isinstance(parsed, _ConfigParseError):
             issues.append(
                 Issue(
                     code="DESTINATION_INVALID",
-                    message="github-actions requires repository as 'owner/name'",
+                    message=parsed.message,
+                    hint=parsed.hint,
                 )
             )
         if _token_env(config) is None:
@@ -166,13 +322,20 @@ class GitHubActionsDestination:
         *,
         kind: ValueKind = ValueKind.SECRET,
     ) -> frozenset[str]:
-        parsed = _parse_repository(config)
+        parsed = _parse_github_target(config)
         token_env = _token_env(config)
-        if parsed is None or token_env is None:
+        if isinstance(parsed, _ConfigParseError) or token_env is None:
+            message = (
+                parsed.message
+                if isinstance(parsed, _ConfigParseError)
+                else "Invalid github-actions destination configuration"
+            )
+            hint = parsed.hint if isinstance(parsed, _ConfigParseError) else None
             raise ListNamesError(
                 SafeConnectorError(
                     code="DESTINATION_INVALID",
-                    message="Invalid github-actions destination configuration",
+                    message=message,
+                    hint=hint,
                     correlation_id=context.correlation_id,
                 )
             )
@@ -194,8 +357,18 @@ class GitHubActionsDestination:
                     correlation_id=context.correlation_id,
                 )
             )
+        resolved = _owner_repo_for_scope(parsed, scope)
+        if isinstance(resolved, _ConfigParseError):
+            raise ListNamesError(
+                SafeConnectorError(
+                    code="DESTINATION_INVALID",
+                    message=resolved.message,
+                    hint=resolved.hint,
+                    correlation_id=context.correlation_id,
+                )
+            )
 
-        owner, repo = parsed
+        owner, repo = resolved
         headers = {
             "Accept": "application/vnd.github+json",
             "Authorization": f"Bearer {token}",
@@ -247,15 +420,20 @@ class GitHubActionsDestination:
         context: OperationContext,
     ) -> ApplyDestinationResult:
         config = request.destination_config
-        parsed = _parse_repository(config)
+        parsed = _parse_github_target(config)
         token_env = _token_env(config)
         all_ids = [m.mutation_id for m in request.mutations] + [
             d.mutation_id for d in request.deletes
         ]
-        if parsed is None or token_env is None:
+        if isinstance(parsed, _ConfigParseError) or token_env is None:
             error = SafeConnectorError(
                 code="DESTINATION_INVALID",
-                message="Invalid github-actions destination configuration",
+                message=(
+                    parsed.message
+                    if isinstance(parsed, _ConfigParseError)
+                    else "Invalid github-actions destination configuration"
+                ),
+                hint=parsed.hint if isinstance(parsed, _ConfigParseError) else None,
                 correlation_id=context.correlation_id,
             )
             return ApplyDestinationResult(
@@ -275,7 +453,6 @@ class GitHubActionsDestination:
                 requests_made=0,
             )
 
-        owner, repo = parsed
         secret_mutations = [m for m in request.mutations if m.kind is ValueKind.SECRET]
         variable_mutations = [m for m in request.mutations if m.kind is ValueKind.VARIABLE]
 
@@ -318,6 +495,22 @@ class GitHubActionsDestination:
                 if scope_id == "invalid":
                     continue
                 scope = dict(mutations[0].scopes[0])
+                resolved = _owner_repo_for_scope(parsed, scope)
+                if isinstance(resolved, _ConfigParseError):
+                    for mutation in mutations:
+                        results[mutation.mutation_id] = MutationResult(
+                            mutation_id=mutation.mutation_id,
+                            status="failed",
+                            error=SafeConnectorError(
+                                code="DESTINATION_INVALID",
+                                message=resolved.message,
+                                hint=resolved.hint,
+                                mutation_id=mutation.mutation_id,
+                                correlation_id=context.correlation_id,
+                            ),
+                        )
+                    continue
+                owner, repo = resolved
                 if scope.get("kind") == "organization":
                     visibility = _org_visibility_payload(scope)
                     if isinstance(visibility, str):
@@ -350,6 +543,8 @@ class GitHubActionsDestination:
                 async def put_one(
                     mutation: PutMutation,
                     put_scope: dict[str, JsonValue],
+                    put_owner: str,
+                    put_repo: str,
                     put_key_id: str,
                     put_key_b64: str,
                 ) -> None:
@@ -357,8 +552,8 @@ class GitHubActionsDestination:
                     async with limiter:
                         result, n = await self._put_secret(
                             client,
-                            owner,
-                            repo,
+                            put_owner,
+                            put_repo,
                             put_scope,
                             mutation,
                             put_key_id,
@@ -370,13 +565,48 @@ class GitHubActionsDestination:
 
                 async with anyio.create_task_group() as tg:
                     for mutation in mutations:
-                        tg.start_soon(put_one, mutation, dict(mutation.scopes[0]), key_id, key_b64)
+                        tg.start_soon(
+                            put_one,
+                            mutation,
+                            dict(mutation.scopes[0]),
+                            owner,
+                            repo,
+                            key_id,
+                            key_b64,
+                        )
 
             async def put_variable(mutation: PutMutation) -> None:
                 nonlocal requests_made
                 async with limiter:
+                    if not mutation.scopes:
+                        results[mutation.mutation_id] = MutationResult(
+                            mutation_id=mutation.mutation_id,
+                            status="failed",
+                            error=SafeConnectorError(
+                                code="DESTINATION_INVALID",
+                                message="Missing GitHub scope on mutation",
+                                mutation_id=mutation.mutation_id,
+                                correlation_id=context.correlation_id,
+                            ),
+                        )
+                        return
+                    resolved = _owner_repo_for_scope(parsed, dict(mutation.scopes[0]))
+                    if isinstance(resolved, _ConfigParseError):
+                        results[mutation.mutation_id] = MutationResult(
+                            mutation_id=mutation.mutation_id,
+                            status="failed",
+                            error=SafeConnectorError(
+                                code="DESTINATION_INVALID",
+                                message=resolved.message,
+                                hint=resolved.hint,
+                                mutation_id=mutation.mutation_id,
+                                correlation_id=context.correlation_id,
+                            ),
+                        )
+                        return
+                    var_owner, var_repo = resolved
                     result, n = await self._put_variable(
-                        client, owner, repo, mutation, context.correlation_id
+                        client, var_owner, var_repo, mutation, context.correlation_id
                     )
                     results[mutation.mutation_id] = result
                     requests_made += n
@@ -386,13 +616,40 @@ class GitHubActionsDestination:
                     tg.start_soon(put_variable, mutation)
 
             for deletion in request.deletes:
+                if not deletion.scopes:
+                    results[deletion.mutation_id] = MutationResult(
+                        mutation_id=deletion.mutation_id,
+                        status="failed",
+                        error=SafeConnectorError(
+                            code="DESTINATION_INVALID",
+                            message="Missing GitHub scope on delete",
+                            mutation_id=deletion.mutation_id,
+                            correlation_id=context.correlation_id,
+                        ),
+                    )
+                    continue
+                resolved = _owner_repo_for_scope(parsed, dict(deletion.scopes[0]))
+                if isinstance(resolved, _ConfigParseError):
+                    results[deletion.mutation_id] = MutationResult(
+                        mutation_id=deletion.mutation_id,
+                        status="failed",
+                        error=SafeConnectorError(
+                            code="DESTINATION_INVALID",
+                            message=resolved.message,
+                            hint=resolved.hint,
+                            mutation_id=deletion.mutation_id,
+                            correlation_id=context.correlation_id,
+                        ),
+                    )
+                    continue
+                del_owner, del_repo = resolved
                 if deletion.kind is ValueKind.VARIABLE:
                     result, n = await self._delete_variable(
-                        client, owner, repo, deletion, context.correlation_id
+                        client, del_owner, del_repo, deletion, context.correlation_id
                     )
                 else:
                     result, n = await self._delete_secret(
-                        client, owner, repo, deletion, context.correlation_id
+                        client, del_owner, del_repo, deletion, context.correlation_id
                     )
                 results[deletion.mutation_id] = result
                 requests_made += n

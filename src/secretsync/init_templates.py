@@ -27,6 +27,10 @@ sets:
 destinations:
   github:
     connector: github-actions
+    # repository: owner/repo
+    # or:
+    # organization: owner
+    # repository: repo
     repository: owner/repo
     auth:
       tokenEnv: GITHUB_TOKEN

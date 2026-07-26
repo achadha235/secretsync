@@ -40,7 +40,7 @@ def _mutation(
 
 
 @pytest.mark.asyncio
-async def test_validate_requires_repository_and_auth() -> None:
+async def test_validate_requires_target_and_auth() -> None:
     dest = GitHubActionsFactory().create(_services())
     issues = await dest.validate({"connector": "github-actions"})
     assert any(i.code == "DESTINATION_INVALID" for i in issues)
@@ -547,3 +547,150 @@ async def test_delete_variable() -> None:
     assert route.called
     assert result.results[0].status == "applied"
     assert result.results[0].effect == "deleted"
+
+
+def test_parse_github_target_allowed_forms() -> None:
+    from secretsync.destinations.github_actions import GitHubRepoRef, _parse_github_target
+
+    org_only = _parse_github_target({"organization": "acme"})
+    assert org_only == GitHubRepoRef(owner="acme", repository=None)
+
+    org_and_name = _parse_github_target({"organization": "acme", "repository": "web"})
+    assert org_and_name == GitHubRepoRef(owner="acme", repository="web")
+
+    shorthand = _parse_github_target({"repository": "acme/web"})
+    assert shorthand == GitHubRepoRef(owner="acme", repository="web")
+
+
+def test_parse_github_target_rejects_org_with_owner_repo() -> None:
+    from secretsync.destinations.github_actions import _ConfigParseError, _parse_github_target
+
+    redundant = _parse_github_target({"organization": "acme", "repository": "acme/web"})
+    assert isinstance(redundant, _ConfigParseError)
+    assert "must not set organization together" in redundant.message
+    assert redundant.hint is not None
+    assert "repository: 'web'" in redundant.hint
+
+    mismatched = _parse_github_target({"organization": "acme", "repository": "other/web"})
+    assert isinstance(mismatched, _ConfigParseError)
+    assert "does not match" in mismatched.message
+    assert "other" in mismatched.message
+
+
+def test_parse_github_target_rejects_bare_repo_without_org() -> None:
+    from secretsync.destinations.github_actions import _ConfigParseError, _parse_github_target
+
+    bare = _parse_github_target({"repository": "web"})
+    assert isinstance(bare, _ConfigParseError)
+    assert "owner/name" in bare.message
+
+
+@pytest.mark.asyncio
+async def test_validate_accepts_organization_and_repo_name() -> None:
+    dest = GitHubActionsFactory().create(_services())
+    issues = await dest.validate(
+        {
+            "connector": "github-actions",
+            "organization": "acme",
+            "repository": "web",
+            "auth": {"tokenEnv": "GITHUB_TOKEN"},
+        }
+    )
+    assert issues == []
+
+
+@pytest.mark.asyncio
+async def test_validate_rejects_organization_with_owner_repo() -> None:
+    dest = GitHubActionsFactory().create(_services())
+    issues = await dest.validate(
+        {
+            "connector": "github-actions",
+            "organization": "acme",
+            "repository": "acme/web",
+            "auth": {"tokenEnv": "GITHUB_TOKEN"},
+        }
+    )
+    assert any(i.code == "DESTINATION_INVALID" for i in issues)
+    assert any("must not set organization together" in i.message for i in issues)
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_apply_with_organization_and_repo_name() -> None:
+    from nacl import encoding
+
+    key = public.PrivateKey.generate().public_key
+    key_b64 = key.encode(encoder=encoding.Base64Encoder).decode()
+    respx.get("https://api.github.com/repos/acme/web/actions/secrets/public-key").mock(
+        return_value=httpx.Response(200, json={"key_id": "key1", "key": key_b64})
+    )
+    respx.put("https://api.github.com/repos/acme/web/actions/secrets/DATABASE_URL").mock(
+        return_value=httpx.Response(201)
+    )
+    dest = GitHubActionsFactory().create(_services())
+    result = await dest.apply(
+        ApplyDestinationRequest(
+            deployment_id="dep",
+            destination_config={
+                "connector": "github-actions",
+                "organization": "acme",
+                "repository": "web",
+                "auth": {"tokenEnv": "GITHUB_TOKEN"},
+            },
+            mutations=[_mutation("DATABASE_URL")],
+        ),
+        OperationContext(correlation_id="c1"),
+    )
+    assert result.results[0].status == "applied"
+    assert result.results[0].effect == "created"
+
+
+@pytest.mark.asyncio
+async def test_org_only_destination_rejects_repo_scope_apply() -> None:
+    dest = GitHubActionsFactory().create(_services())
+    result = await dest.apply(
+        ApplyDestinationRequest(
+            deployment_id="dep",
+            destination_config={
+                "connector": "github-actions",
+                "organization": "acme",
+                "auth": {"tokenEnv": "GITHUB_TOKEN"},
+            },
+            mutations=[_mutation("A")],
+        ),
+        OperationContext(correlation_id="c1"),
+    )
+    assert result.results[0].status == "failed"
+    assert result.results[0].error is not None
+    assert "no repository" in result.results[0].error.message
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_org_only_destination_allows_organization_scope() -> None:
+    from nacl import encoding
+
+    key = public.PrivateKey.generate().public_key
+    key_b64 = key.encode(encoder=encoding.Base64Encoder).decode()
+    respx.get("https://api.github.com/orgs/acme/actions/secrets/public-key").mock(
+        return_value=httpx.Response(200, json={"key_id": "org-key", "key": key_b64})
+    )
+    put = respx.put("https://api.github.com/orgs/acme/actions/secrets/ORG_SECRET").mock(
+        return_value=httpx.Response(201)
+    )
+    dest = GitHubActionsFactory().create(_services())
+    result = await dest.apply(
+        ApplyDestinationRequest(
+            deployment_id="dep",
+            destination_config={
+                "connector": "github-actions",
+                "organization": "acme",
+                "auth": {"tokenEnv": "GITHUB_TOKEN"},
+            },
+            mutations=[_mutation("ORG_SECRET", kind="organization")],
+        ),
+        OperationContext(correlation_id="c1"),
+    )
+    assert put.called
+    assert result.results[0].status == "applied"
+    assert result.results[0].effect == "created"

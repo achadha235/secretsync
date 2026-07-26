@@ -54,7 +54,11 @@ sets:
 destinations:
   github:
     connector: github-actions
+    # Either repository: owner/name …
     repository: owner/repo
+    # … or organization: + repository: name (not both with owner/name)
+    # organization: owner
+    # repository: repo
     auth:
       tokenEnv: GITHUB_TOKEN # reads os.environ["GITHUB_TOKEN"] for API auth
 
@@ -73,7 +77,8 @@ deployments:
       # logical id → remote variable name (Actions Variables API)
       logLevel: LOG_LEVEL
 
-  # Org secrets/variables: org name is the owner of repository (acme from acme/web).
+  # Org secrets/variables: org is destination.organization, or the owner of
+  # repository (acme from acme/web). Org-only destinations work for this scope.
   # Token needs admin:org (classic PAT). visibility defaults to private.
   - name: github-org
     set: production
