@@ -118,9 +118,7 @@ async def build_plan_async(
         selected,
         clear=False,
         capability_label="prune",
-        capability_hint=(
-            "Omit --prune for this destination, or use a connector that supports it."
-        ),
+        capability_hint=("Omit --prune for this destination, or use a connector that supports it."),
     )
     return Plan(strategy="always-write", puts=plan.puts, deletes=tuple(deletes))
 
