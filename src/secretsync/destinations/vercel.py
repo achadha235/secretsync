@@ -566,9 +566,7 @@ class VercelDestination:
             client, "GET", list_url, params=params, correlation_id=correlation_id
         )
         if listed.status_code != 200:
-            raise ListNamesError(
-                error_for_status(listed, correlation_id=correlation_id)
-            )
+            raise ListNamesError(error_for_status(listed, correlation_id=correlation_id))
         return _parse_env_list(listed.json()), 1
 
     async def _list_shared_envs(
@@ -591,9 +589,7 @@ class VercelDestination:
             )
             requests += 1
             if listed.status_code != 200:
-                raise ListNamesError(
-                    error_for_status(listed, correlation_id=correlation_id)
-                )
+                raise ListNamesError(error_for_status(listed, correlation_id=correlation_id))
             page, next_ts = _parse_shared_env_page(listed.json())
             items.extend(page)
             if next_ts is None:

@@ -267,8 +267,7 @@ def _org_visibility_error(scope: Mapping[str, JsonValue]) -> str | None:
         )
         if not valid_ids:
             return (
-                "selectedRepositoryIds required as non-empty int array "
-                "when visibility is selected"
+                "selectedRepositoryIds required as non-empty int array when visibility is selected"
             )
     return None
 
@@ -289,6 +288,7 @@ def _org_visibility_payload(scope: Mapping[str, JsonValue]) -> dict[str, JsonVal
         # GitHub Actions API field name is snake_case.
         payload["selected_repository_ids"] = list(ids)
     return payload
+
 
 def _invalid_scope_kind(scope: Mapping[str, JsonValue]) -> str | None:
     kind = scope.get("kind")
@@ -424,9 +424,7 @@ class GitHubActionsDestination:
                         from secretsync.infrastructure.http import error_for_status
 
                         raise ListNamesError(
-                            error_for_status(
-                                response, correlation_id=context.correlation_id
-                            )
+                            error_for_status(response, correlation_id=context.correlation_id)
                         )
                     payload = response.json()
                     items = payload.get(collection_key, []) if isinstance(payload, dict) else []
@@ -725,9 +723,7 @@ class GitHubActionsDestination:
         if response.status_code != 200:
             from secretsync.infrastructure.http import error_for_status
 
-            raise HttpRequestError(
-                error_for_status(response, correlation_id=correlation_id)
-            )
+            raise HttpRequestError(error_for_status(response, correlation_id=correlation_id))
         payload = response.json()
         key_id = str(payload["key_id"])
         key_b64 = str(payload["key"])
