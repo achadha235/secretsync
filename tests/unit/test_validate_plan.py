@@ -135,6 +135,20 @@ def test_vercel_sensitive_deprecated() -> None:
     assert "deployment.variables" in result.issues[0].hint
 
 
+def test_vercel_requires_team_id_offline() -> None:
+    services = create_services({"API_KEY": "x", "VERCEL_TOKEN": "t"})
+    result = validate_config(services, fixture_path("vercel_missing_team.yaml"))
+    assert not result.ok
+    assert "teamId" in result.issues[0].message
+
+
+def test_vercel_environment_requires_project_offline() -> None:
+    services = create_services({"API_KEY": "x", "VERCEL_TOKEN": "t"})
+    result = validate_config(services, fixture_path("vercel_environment_missing_project.yaml"))
+    assert not result.ok
+    assert "project" in result.issues[0].message.lower() or "project" in result.issues[0].message
+
+
 def test_mixed_variables_plan_emits_kinds() -> None:
     from secretsync.domain.models import ValueKind
 

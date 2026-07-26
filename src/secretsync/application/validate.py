@@ -132,15 +132,8 @@ def _validate_deployments(
                 f"'{destination.connector}'"
             )
 
-        if destination.connector == "vercel" and "sensitive" in deployment.scope:
-            raise ConfigInvalidError(
-                f"Deployment '{deployment.name}' uses deprecated scope.sensitive on Vercel",
-                hint=(
-                    "Remove scope.sensitive. Put sensitive values under deployment.secrets "
-                    "and plaintext under deployment.variables; the vercel connector sets "
-                    "type from kind."
-                ),
-            )
+        if destination.connector == "vercel":
+            _validate_vercel_deployment(deployment, destination)
 
         available = composed[deployment.set]
         kinds_used: set[ValueKind] = set()
@@ -197,6 +190,48 @@ def _validate_deployments(
                         ),
                         hint=issue.hint,
                     )
+
+
+def _validate_vercel_deployment(deployment: DeploymentDefinition, destination: object) -> None:
+    from secretsync.destinations.vercel import _project, _team_id, _validate_scope
+
+    dest_cfg = destination.model_dump(by_alias=True)  # type: ignore[attr-defined]
+    if _team_id(dest_cfg) is None:
+        raise ConfigInvalidError(
+            f"Destination '{deployment.destination}' (vercel) requires teamId",
+            hint="Set destinations.<name>.teamId to your Vercel team id (team_…)",
+        )
+    if "sensitive" in deployment.scope:
+        raise ConfigInvalidError(
+            f"Deployment '{deployment.name}' uses deprecated scope.sensitive on Vercel",
+            hint=(
+                "Remove scope.sensitive. Put sensitive values under deployment.secrets "
+                "and plaintext under deployment.variables; the vercel connector sets "
+                "type from kind."
+            ),
+        )
+    kinds: list[ValueKind] = []
+    if deployment.secrets:
+        kinds.append(ValueKind.SECRET)
+    if deployment.variables:
+        kinds.append(ValueKind.VARIABLE)
+    if not kinds:
+        kinds.append(ValueKind.SECRET)
+    project = _project(dest_cfg)
+    for kind in kinds:
+        reason = _validate_scope(
+            deployment.scope,
+            kind=kind,
+            destination_project=project,
+        )
+        if reason:
+            raise ConfigInvalidError(
+                f"Deployment '{deployment.name}' has invalid Vercel scope: {reason}",
+                hint=(
+                    "Use scope.kind: environment (requires destination.project) or "
+                    "shared-environment (optional scope.projects)."
+                ),
+            )
 
 
 def _record_target(

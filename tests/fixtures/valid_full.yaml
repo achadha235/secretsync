@@ -49,6 +49,7 @@ deployments:
     set: production
     destination: vercel
     scope:
+      kind: environment
       targets: [production]
     secrets:
       databaseUrl: POSTGRES_URL

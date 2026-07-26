@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 import respx
 
 from secretsync.application.services import create_services
-from secretsync.destinations.base import ApplyDestinationRequest, OperationContext, PutMutation
+from secretsync.destinations.base import (
+    ApplyDestinationRequest,
+    DeleteMutation,
+    OperationContext,
+    PutMutation,
+)
 from secretsync.destinations.vercel import VercelFactory
 from secretsync.domain.models import ValueKind
 
@@ -14,18 +21,35 @@ def _services() -> object:
     return create_services({"VERCEL_TOKEN": "vercel_test_token"})
 
 
+def _dest_config(**extra: object) -> dict[str, object]:
+    config: dict[str, object] = {
+        "connector": "vercel",
+        "teamId": "team_abc",
+        "auth": {"tokenEnv": "VERCEL_TOKEN"},
+    }
+    config.update(extra)
+    return config
+
+
 def _mutation(
     name: str,
     *,
     targets: list[str] | None = None,
     kind: ValueKind = ValueKind.SECRET,
+    scope_kind: str = "environment",
     git_branch: str | None = None,
+    projects: list[str] | None = None,
     value: bytes = b"SECRET_CANARY_vc",
     extra_scope: dict[str, object] | None = None,
 ) -> PutMutation:
-    scope: dict[str, object] = {"targets": targets or ["production"]}
+    scope: dict[str, object] = {
+        "kind": scope_kind,
+        "targets": targets or ["production"],
+    }
     if git_branch is not None:
         scope["gitBranch"] = git_branch
+    if projects is not None:
+        scope["projects"] = projects
     if extra_scope:
         scope.update(extra_scope)
     return PutMutation(
@@ -38,10 +62,24 @@ def _mutation(
 
 
 @pytest.mark.asyncio
-async def test_validate_requires_project_and_auth() -> None:
+async def test_validate_requires_team_id_and_auth() -> None:
     dest = VercelFactory().create(_services())
     issues = await dest.validate({"connector": "vercel"})
-    assert any("project" in i.message for i in issues)
+    assert any("teamId" in i.message for i in issues)
+    assert any(i.code == "AUTH_MISSING" for i in issues)
+
+
+@pytest.mark.asyncio
+async def test_validate_project_optional() -> None:
+    dest = VercelFactory().create(_services())
+    issues = await dest.validate(
+        {
+            "connector": "vercel",
+            "teamId": "team_abc",
+            "auth": {"tokenEnv": "VERCEL_TOKEN"},
+        }
+    )
+    assert issues == []
 
 
 @pytest.mark.asyncio
@@ -50,11 +88,7 @@ async def test_secret_rejects_development_target() -> None:
     result = await dest.apply(
         ApplyDestinationRequest(
             deployment_id="dep",
-            destination_config={
-                "connector": "vercel",
-                "project": "web",
-                "auth": {"tokenEnv": "VERCEL_TOKEN"},
-            },
+            destination_config=_dest_config(project="web"),  # type: ignore[arg-type]
             mutations=[_mutation("A", targets=["development"], kind=ValueKind.SECRET)],
         ),
         OperationContext(correlation_id="c1"),
@@ -70,11 +104,7 @@ async def test_scope_sensitive_rejected() -> None:
     result = await dest.apply(
         ApplyDestinationRequest(
             deployment_id="dep",
-            destination_config={
-                "connector": "vercel",
-                "project": "web",
-                "auth": {"tokenEnv": "VERCEL_TOKEN"},
-            },
+            destination_config=_dest_config(project="web"),  # type: ignore[arg-type]
             mutations=[_mutation("A", extra_scope={"sensitive": True})],
         ),
         OperationContext(correlation_id="c1"),
@@ -82,6 +112,85 @@ async def test_scope_sensitive_rejected() -> None:
     assert result.results[0].status == "failed"
     assert result.results[0].error is not None
     assert "scope.sensitive" in result.results[0].error.message
+
+
+@pytest.mark.asyncio
+async def test_environment_requires_project() -> None:
+    dest = VercelFactory().create(_services())
+    result = await dest.apply(
+        ApplyDestinationRequest(
+            deployment_id="dep",
+            destination_config=_dest_config(),  # type: ignore[arg-type]
+            mutations=[_mutation("A")],
+        ),
+        OperationContext(correlation_id="c1"),
+    )
+    assert result.results[0].status == "failed"
+    assert result.results[0].error is not None
+    assert "project" in result.results[0].error.message
+
+
+@pytest.mark.asyncio
+async def test_environment_rejects_projects() -> None:
+    dest = VercelFactory().create(_services())
+    result = await dest.apply(
+        ApplyDestinationRequest(
+            deployment_id="dep",
+            destination_config=_dest_config(project="web"),  # type: ignore[arg-type]
+            mutations=[_mutation("A", projects=["prj_a"])],
+        ),
+        OperationContext(correlation_id="c1"),
+    )
+    assert result.results[0].status == "failed"
+    assert result.results[0].error is not None
+    assert "projects" in result.results[0].error.message
+
+
+@pytest.mark.asyncio
+async def test_shared_rejects_git_branch() -> None:
+    dest = VercelFactory().create(_services())
+    result = await dest.apply(
+        ApplyDestinationRequest(
+            deployment_id="dep",
+            destination_config=_dest_config(),  # type: ignore[arg-type]
+            mutations=[
+                _mutation(
+                    "A",
+                    scope_kind="shared-environment",
+                    git_branch="feat",
+                    targets=["preview"],
+                )
+            ],
+        ),
+        OperationContext(correlation_id="c1"),
+    )
+    assert result.results[0].status == "failed"
+    assert result.results[0].error is not None
+    assert "gitBranch" in result.results[0].error.message
+
+
+@pytest.mark.asyncio
+async def test_missing_scope_kind_rejected() -> None:
+    dest = VercelFactory().create(_services())
+    result = await dest.apply(
+        ApplyDestinationRequest(
+            deployment_id="dep",
+            destination_config=_dest_config(project="web"),  # type: ignore[arg-type]
+            mutations=[
+                PutMutation(
+                    mutation_id="dep:A",
+                    name="A",
+                    value=bytearray(b"x"),
+                    scopes=({"targets": ["production"]},),
+                    kind=ValueKind.SECRET,
+                )
+            ],
+        ),
+        OperationContext(correlation_id="c1"),
+    )
+    assert result.results[0].status == "failed"
+    assert result.results[0].error is not None
+    assert "scope.kind" in result.results[0].error.message
 
 
 @pytest.mark.asyncio
@@ -94,12 +203,7 @@ async def test_bulk_upsert_secret_type_sensitive() -> None:
     result = await dest.apply(
         ApplyDestinationRequest(
             deployment_id="dep",
-            destination_config={
-                "connector": "vercel",
-                "project": "web",
-                "teamId": "team_abc",
-                "auth": {"tokenEnv": "VERCEL_TOKEN"},
-            },
+            destination_config=_dest_config(project="web"),  # type: ignore[arg-type]
             mutations=[
                 _mutation("DATABASE_URL", kind=ValueKind.SECRET),
                 _mutation("API_TOKEN", kind=ValueKind.SECRET),
@@ -127,11 +231,7 @@ async def test_bulk_upsert_variable_type_encrypted() -> None:
     result = await dest.apply(
         ApplyDestinationRequest(
             deployment_id="dep",
-            destination_config={
-                "connector": "vercel",
-                "project": "web",
-                "auth": {"tokenEnv": "VERCEL_TOKEN"},
-            },
+            destination_config=_dest_config(project="web"),  # type: ignore[arg-type]
             mutations=[
                 _mutation("PUBLIC_APP_URL", kind=ValueKind.VARIABLE, value=b"https://app.example"),
                 _mutation("LOG_LEVEL", kind=ValueKind.VARIABLE, value=b"info"),
@@ -156,11 +256,7 @@ async def test_mixed_secret_and_variable_types() -> None:
     result = await dest.apply(
         ApplyDestinationRequest(
             deployment_id="dep",
-            destination_config={
-                "connector": "vercel",
-                "project": "web",
-                "auth": {"tokenEnv": "VERCEL_TOKEN"},
-            },
+            destination_config=_dest_config(project="web"),  # type: ignore[arg-type]
             mutations=[
                 _mutation("API_KEY", kind=ValueKind.SECRET),
                 _mutation("LOG_LEVEL", kind=ValueKind.VARIABLE, value=b"debug"),
@@ -170,8 +266,6 @@ async def test_mixed_secret_and_variable_types() -> None:
     )
     assert result.requests_made == 1
     assert all(r.status == "applied" for r in result.results)
-    import json
-
     payload = json.loads(route.calls[0].request.read())
     by_key = {item["key"]: item["type"] for item in payload}
     assert by_key["API_KEY"] == "sensitive"
@@ -208,11 +302,7 @@ async def test_chunking_requests_made() -> None:
     result = await dest.apply(
         ApplyDestinationRequest(
             deployment_id="dep",
-            destination_config={
-                "connector": "vercel",
-                "project": "web",
-                "auth": {"tokenEnv": "VERCEL_TOKEN"},
-            },
+            destination_config=_dest_config(project="web"),  # type: ignore[arg-type]
             mutations=[_mutation(f"K{i}") for i in range(5)],
         ),
         OperationContext(correlation_id="c1"),
@@ -237,15 +327,16 @@ async def test_list_names_filters_by_kind_type() -> None:
         )
     )
     dest = VercelFactory().create(_services())
+    scope = {"kind": "environment", "targets": ["production"]}
     secrets = await dest.list_names(
-        {"project": "web", "auth": {"tokenEnv": "VERCEL_TOKEN"}},
-        {"targets": ["production"]},
+        _dest_config(project="web"),  # type: ignore[arg-type]
+        scope,  # type: ignore[arg-type]
         OperationContext(correlation_id="c1"),
         kind=ValueKind.SECRET,
     )
     variables = await dest.list_names(
-        {"project": "web", "auth": {"tokenEnv": "VERCEL_TOKEN"}},
-        {"targets": ["production"]},
+        _dest_config(project="web"),  # type: ignore[arg-type]
+        scope,  # type: ignore[arg-type]
         OperationContext(correlation_id="c1"),
         kind=ValueKind.VARIABLE,
     )
@@ -260,11 +351,7 @@ async def test_git_branch_validation() -> None:
     result = await dest.apply(
         ApplyDestinationRequest(
             deployment_id="dep",
-            destination_config={
-                "connector": "vercel",
-                "project": "web",
-                "auth": {"tokenEnv": "VERCEL_TOKEN"},
-            },
+            destination_config=_dest_config(project="web"),  # type: ignore[arg-type]
             mutations=[_mutation("A", targets=["production"], git_branch="feat")],
         ),
         OperationContext(correlation_id="c1"),
@@ -284,11 +371,7 @@ async def test_variable_allows_development_target() -> None:
     result = await dest.apply(
         ApplyDestinationRequest(
             deployment_id="dep",
-            destination_config={
-                "connector": "vercel",
-                "project": "web",
-                "auth": {"tokenEnv": "VERCEL_TOKEN"},
-            },
+            destination_config=_dest_config(project="web"),  # type: ignore[arg-type]
             mutations=[
                 _mutation("LOG_LEVEL", targets=["development"], kind=ValueKind.VARIABLE, value=b"x")
             ],
@@ -307,11 +390,7 @@ async def test_batch_failure_marks_all() -> None:
     result = await dest.apply(
         ApplyDestinationRequest(
             deployment_id="dep",
-            destination_config={
-                "connector": "vercel",
-                "project": "web",
-                "auth": {"tokenEnv": "VERCEL_TOKEN"},
-            },
+            destination_config=_dest_config(project="web"),  # type: ignore[arg-type]
             mutations=[_mutation("A"), _mutation("B")],
         ),
         OperationContext(correlation_id="c1"),
@@ -350,11 +429,7 @@ async def test_conflict_edit_fallback() -> None:
     result = await dest.apply(
         ApplyDestinationRequest(
             deployment_id="dep",
-            destination_config={
-                "connector": "vercel",
-                "project": "web",
-                "auth": {"tokenEnv": "VERCEL_TOKEN"},
-            },
+            destination_config=_dest_config(project="web"),  # type: ignore[arg-type]
             mutations=[_mutation("DATABASE_URL")],
         ),
         OperationContext(correlation_id="c1"),
@@ -387,12 +462,8 @@ async def test_list_names_filters_by_targets() -> None:
     )
     dest = VercelFactory().create(_services())
     names = await dest.list_names(
-        {
-            "connector": "vercel",
-            "project": "web",
-            "auth": {"tokenEnv": "VERCEL_TOKEN"},
-        },
-        {"targets": ["production"]},
+        _dest_config(project="web"),  # type: ignore[arg-type]
+        {"kind": "environment", "targets": ["production"]},  # type: ignore[arg-type]
         OperationContext(correlation_id="c1"),
         kind=ValueKind.VARIABLE,
     )
@@ -402,8 +473,6 @@ async def test_list_names_filters_by_targets() -> None:
 @pytest.mark.asyncio
 @respx.mock
 async def test_delete_env_by_id() -> None:
-    from secretsync.destinations.base import DeleteMutation
-
     respx.get("https://api.vercel.com/v9/projects/web/env").mock(
         return_value=httpx.Response(
             200,
@@ -426,17 +495,13 @@ async def test_delete_env_by_id() -> None:
     result = await dest.apply(
         ApplyDestinationRequest(
             deployment_id="dep",
-            destination_config={
-                "connector": "vercel",
-                "project": "web",
-                "auth": {"tokenEnv": "VERCEL_TOKEN"},
-            },
+            destination_config=_dest_config(project="web"),  # type: ignore[arg-type]
             mutations=[],
             deletes=[
                 DeleteMutation(
                     mutation_id="dep:delete:ORPHAN",
                     name="ORPHAN",
-                    scopes=({"targets": ["production"]},),
+                    scopes=({"kind": "environment", "targets": ["production"]},),
                     kind=ValueKind.VARIABLE,
                 )
             ],
@@ -444,5 +509,216 @@ async def test_delete_env_by_id() -> None:
         OperationContext(correlation_id="c1"),
     )
     assert delete.called
+    assert result.results[0].status == "applied"
+    assert result.results[0].effect == "deleted"
+
+
+def _empty_shared_list() -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={"data": [], "pagination": {"count": 0, "next": None, "prev": None}},
+    )
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_shared_create() -> None:
+    respx.get("https://api.vercel.com/v1/env").mock(return_value=_empty_shared_list())
+    create = respx.post("https://api.vercel.com/v1/env").mock(
+        return_value=httpx.Response(201, json={"created": [], "failed": []})
+    )
+    dest = VercelFactory().create(_services())
+    result = await dest.apply(
+        ApplyDestinationRequest(
+            deployment_id="dep",
+            destination_config=_dest_config(),  # type: ignore[arg-type]
+            mutations=[
+                _mutation(
+                    "SHARED_SECRET",
+                    scope_kind="shared-environment",
+                    projects=["prj_a", "prj_b"],
+                )
+            ],
+        ),
+        OperationContext(correlation_id="c1"),
+    )
+    assert result.results[0].status == "applied"
+    assert result.results[0].effect == "upserted"
+    assert create.called
+    assert create.calls[0].request.url.params["teamId"] == "team_abc"
+    body = json.loads(create.calls[0].request.read())
+    assert body["type"] == "sensitive"
+    assert body["target"] == ["production"]
+    assert body["projectId"] == ["prj_a", "prj_b"]
+    assert body["evs"][0]["key"] == "SHARED_SECRET"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_shared_create_omits_empty_projects() -> None:
+    respx.get("https://api.vercel.com/v1/env").mock(return_value=_empty_shared_list())
+    create = respx.post("https://api.vercel.com/v1/env").mock(
+        return_value=httpx.Response(201, json={"created": [], "failed": []})
+    )
+    dest = VercelFactory().create(_services())
+    result = await dest.apply(
+        ApplyDestinationRequest(
+            deployment_id="dep",
+            destination_config=_dest_config(),  # type: ignore[arg-type]
+            mutations=[_mutation("UNLINKED", scope_kind="shared-environment")],
+        ),
+        OperationContext(correlation_id="c1"),
+    )
+    assert result.results[0].status == "applied"
+    body = json.loads(create.calls[0].request.read())
+    assert "projectId" not in body
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_shared_patch_existing() -> None:
+    respx.get("https://api.vercel.com/v1/env").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "id": "env_shared_1",
+                        "key": "SHARED_SECRET",
+                        "type": "sensitive",
+                        "target": ["production"],
+                        "projectId": ["prj_a", "prj_b"],
+                    }
+                ],
+                "pagination": {"count": 1, "next": None, "prev": None},
+            },
+        )
+    )
+    patch = respx.patch("https://api.vercel.com/v1/env").mock(
+        return_value=httpx.Response(200, json={"updated": [], "failed": []})
+    )
+    dest = VercelFactory().create(_services())
+    result = await dest.apply(
+        ApplyDestinationRequest(
+            deployment_id="dep",
+            destination_config=_dest_config(),  # type: ignore[arg-type]
+            mutations=[
+                _mutation(
+                    "SHARED_SECRET",
+                    scope_kind="shared-environment",
+                    projects=["prj_a", "prj_b"],
+                    value=b"rotated",
+                )
+            ],
+        ),
+        OperationContext(correlation_id="c1"),
+    )
+    assert result.results[0].status == "applied"
+    assert result.results[0].effect == "updated"
+    assert patch.called
+    body = json.loads(patch.calls[0].request.read())
+    assert "env_shared_1" in body["updates"]
+    assert body["updates"]["env_shared_1"]["value"] == "rotated"
+    assert body["updates"]["env_shared_1"]["projectId"] == ["prj_a", "prj_b"]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_shared_list_exact_projects_match() -> None:
+    respx.get("https://api.vercel.com/v1/env").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "id": "1",
+                        "key": "LINKED",
+                        "type": "sensitive",
+                        "target": ["production"],
+                        "projectId": ["prj_a", "prj_b"],
+                    },
+                    {
+                        "id": "2",
+                        "key": "OTHER_LINK",
+                        "type": "sensitive",
+                        "target": ["production"],
+                        "projectId": ["prj_a"],
+                    },
+                    {
+                        "id": "3",
+                        "key": "UNLINKED",
+                        "type": "sensitive",
+                        "target": ["production"],
+                        "projectId": [],
+                    },
+                ],
+                "pagination": {"count": 3, "next": None, "prev": None},
+            },
+        )
+    )
+    dest = VercelFactory().create(_services())
+    linked = await dest.list_names(
+        _dest_config(),  # type: ignore[arg-type]
+        {
+            "kind": "shared-environment",
+            "targets": ["production"],
+            "projects": ["prj_a", "prj_b"],
+        },  # type: ignore[arg-type]
+        OperationContext(correlation_id="c1"),
+        kind=ValueKind.SECRET,
+    )
+    unlinked = await dest.list_names(
+        _dest_config(),  # type: ignore[arg-type]
+        {"kind": "shared-environment", "targets": ["production"]},  # type: ignore[arg-type]
+        OperationContext(correlation_id="c1"),
+        kind=ValueKind.SECRET,
+    )
+    assert linked == frozenset({"LINKED"})
+    assert unlinked == frozenset({"UNLINKED"})
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_shared_delete() -> None:
+    respx.get("https://api.vercel.com/v1/env").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "id": "env_orphan",
+                        "key": "ORPHAN",
+                        "type": "encrypted",
+                        "target": ["production"],
+                        "projectId": [],
+                    }
+                ],
+                "pagination": {"count": 1, "next": None, "prev": None},
+            },
+        )
+    )
+    delete = respx.delete("https://api.vercel.com/v1/env").mock(
+        return_value=httpx.Response(200, json={"deleted": ["env_orphan"], "failed": []})
+    )
+    dest = VercelFactory().create(_services())
+    result = await dest.apply(
+        ApplyDestinationRequest(
+            deployment_id="dep",
+            destination_config=_dest_config(),  # type: ignore[arg-type]
+            mutations=[],
+            deletes=[
+                DeleteMutation(
+                    mutation_id="dep:delete:ORPHAN",
+                    name="ORPHAN",
+                    scopes=({"kind": "shared-environment", "targets": ["production"]},),
+                    kind=ValueKind.VARIABLE,
+                )
+            ],
+        ),
+        OperationContext(correlation_id="c1"),
+    )
+    assert delete.called
+    body = json.loads(delete.calls[0].request.read())
+    assert body == {"ids": ["env_orphan"]}
     assert result.results[0].status == "applied"
     assert result.results[0].effect == "deleted"

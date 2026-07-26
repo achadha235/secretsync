@@ -95,6 +95,39 @@ deployments:
 Kind is declared once under `secrets` or `variables`. Connectors map kind to the provider primitive (GitHub secrets vs variables APIs; Vercel `type: sensitive` vs `encrypted`). SST supports secrets only — non-secret SST config belongs in code as [Linkables](https://sst.dev/docs/component/linkable/).
 
 > **Breaking:** Vercel `scope.sensitive` is removed. Put sensitive values under `deployment.secrets` and plaintext under `deployment.variables`.
+>
+> **Breaking:** Vercel destinations require `teamId`. Project env deployments need `scope.kind: environment` (and destination `project`). Team shared env uses `scope.kind: shared-environment` with optional `scope.projects`.
+
+Vercel destination modes (selected by `scope.kind`):
+
+```yaml
+destinations:
+  vercel:
+    connector: vercel
+    teamId: team_xyz          # required
+    project: prj_abc          # optional; required for kind: environment
+    auth:
+      tokenEnv: VERCEL_TOKEN
+
+deployments:
+  - name: vercel-production
+    set: production
+    destination: vercel
+    scope:
+      kind: environment
+      targets: [production]
+    secrets:
+      apiKey: API_KEY
+  - name: vercel-shared
+    set: production
+    destination: vercel
+    scope:
+      kind: shared-environment
+      targets: [production]
+      projects: [prj_abc, prj_def]  # optional link set
+    secrets:
+      sharedSecret: SHARED_SECRET
+```
 
 ## Deploy secrets
 

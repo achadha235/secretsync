@@ -9,8 +9,8 @@ sets:
 destinations:
   vercel:
     connector: vercel
-    project: web
     teamId: team_abc
+    # project intentionally missing
     auth:
       tokenEnv: VERCEL_TOKEN
 deployments:
@@ -20,6 +20,5 @@ deployments:
     scope:
       kind: environment
       targets: [production]
-      sensitive: true
     secrets:
       apiKey: API_KEY
