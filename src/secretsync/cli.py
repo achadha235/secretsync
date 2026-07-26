@@ -11,6 +11,7 @@ import anyio
 import click
 from loguru import logger
 
+from secretsync import __version__
 from secretsync.application.apply import run_apply
 from secretsync.application.health import (
     HealthReport,
@@ -342,6 +343,12 @@ def connectors_cmd(ctx: AppContext) -> None:
         for item in manifests:
             click.echo(f"  - {item['id']} ({item['version']}) [{item['status']}]")
     raise SystemExit(EXIT_OK)
+
+
+@cli.command("version")
+def version_cmd() -> None:
+    """Display the installed SecretSync CLI version."""
+    click.echo(__version__)
 
 
 def main() -> None:
