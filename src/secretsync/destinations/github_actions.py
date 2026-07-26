@@ -236,7 +236,7 @@ def _scope_key(scope: Mapping[str, JsonValue]) -> str:
         return f"environment:{scope.get('environment', '')}"
     if kind == "organization":
         visibility = scope.get("visibility", "private")
-        ids = scope.get("selected_repository_ids")
+        ids = scope.get("selectedRepositoryIds")
         if visibility == "selected" and isinstance(ids, list):
             return f"organization:{visibility}:{','.join(str(i) for i in ids)}"
         return f"organization:{visibility}"
@@ -250,14 +250,15 @@ def _public_key_cache_key(scope: Mapping[str, JsonValue]) -> str:
     return _scope_key(scope)
 
 
-def _org_visibility_payload(scope: Mapping[str, JsonValue]) -> dict[str, JsonValue] | str:
-    """Return visibility fields for org create/update, or an error message."""
-    visibility = scope.get("visibility", "private")
+def _org_visibility_error(scope: Mapping[str, JsonValue]) -> str | None:
+    """Validate organization visibility / selectedRepositoryIds; None if ok."""
+    if "visibility" not in scope:
+        return "organization scope requires visibility; require all|private|selected"
+    visibility = scope.get("visibility")
     if visibility not in ORG_VISIBILITIES:
         return "Invalid organization visibility; require all|private|selected"
-    payload: dict[str, JsonValue] = {"visibility": str(visibility)}
     if visibility == "selected":
-        ids = scope.get("selected_repository_ids")
+        ids = scope.get("selectedRepositoryIds")
         # bool is a subclass of int; reject it explicitly.
         valid_ids = (
             isinstance(ids, list)
@@ -266,12 +267,28 @@ def _org_visibility_payload(scope: Mapping[str, JsonValue]) -> dict[str, JsonVal
         )
         if not valid_ids:
             return (
-                "selected_repository_ids required as non-empty int array "
+                "selectedRepositoryIds required as non-empty int array "
                 "when visibility is selected"
             )
-        payload["selected_repository_ids"] = list(ids)  # type: ignore[arg-type]
-    return payload
+    return None
 
+
+def _org_visibility_payload(scope: Mapping[str, JsonValue]) -> dict[str, JsonValue] | str:
+    """Return visibility fields for org create/update, or an error message."""
+    # Apply keeps a private default for callers that skip offline validate.
+    if "visibility" not in scope:
+        scope = {**scope, "visibility": "private"}
+    err = _org_visibility_error(scope)
+    if err is not None:
+        return err
+    visibility = str(scope["visibility"])
+    payload: dict[str, JsonValue] = {"visibility": visibility}
+    if visibility == "selected":
+        ids = scope["selectedRepositoryIds"]
+        assert isinstance(ids, list)  # narrowed by _org_visibility_error
+        # GitHub Actions API field name is snake_case.
+        payload["selected_repository_ids"] = list(ids)
+    return payload
 
 def _invalid_scope_kind(scope: Mapping[str, JsonValue]) -> str | None:
     kind = scope.get("kind")
@@ -279,6 +296,16 @@ def _invalid_scope_kind(scope: Mapping[str, JsonValue]) -> str | None:
         return "Invalid GitHub scope; environment name required"
     if kind not in VALID_SCOPE_KINDS:
         return SCOPE_KIND_MESSAGE
+    return None
+
+
+def _validate_scope(scope: Mapping[str, JsonValue]) -> str | None:
+    """Offline / preflight scope checks. Return error message or None."""
+    kind_err = _invalid_scope_kind(scope)
+    if kind_err is not None:
+        return kind_err
+    if scope.get("kind") == "organization":
+        return _org_visibility_error(scope)
     return None
 
 
@@ -398,7 +425,7 @@ class GitHubActionsDestination:
 
                         raise ListNamesError(
                             error_for_status(
-                                response.status_code, correlation_id=context.correlation_id
+                                response, correlation_id=context.correlation_id
                             )
                         )
                     payload = response.json()
@@ -699,7 +726,7 @@ class GitHubActionsDestination:
             from secretsync.infrastructure.http import error_for_status
 
             raise HttpRequestError(
-                error_for_status(response.status_code, correlation_id=correlation_id)
+                error_for_status(response, correlation_id=correlation_id)
             )
         payload = response.json()
         key_id = str(payload["key_id"])
@@ -793,9 +820,10 @@ class GitHubActionsDestination:
                     mutation_id=mutation.mutation_id,
                     status="failed",
                     error=error_for_status(
-                        response.status_code,
+                        response,
                         mutation_id=mutation.mutation_id,
                         correlation_id=correlation_id,
+                        secrets=[bytes(mutation.value).decode("utf-8", errors="replace")],
                     ),
                 ),
                 1,
@@ -930,9 +958,10 @@ class GitHubActionsDestination:
                         mutation_id=mutation.mutation_id,
                         status="failed",
                         error=error_for_status(
-                            update.status_code,
+                            update,
                             mutation_id=mutation.mutation_id,
                             correlation_id=correlation_id,
+                            secrets=[bytes(mutation.value).decode("utf-8", errors="replace")],
                         ),
                     ),
                     2,
@@ -944,9 +973,10 @@ class GitHubActionsDestination:
                     mutation_id=mutation.mutation_id,
                     status="failed",
                     error=error_for_status(
-                        create.status_code,
+                        create,
                         mutation_id=mutation.mutation_id,
                         correlation_id=correlation_id,
+                        secrets=[bytes(mutation.value).decode("utf-8", errors="replace")],
                     ),
                 ),
                 1,
@@ -1038,7 +1068,7 @@ class GitHubActionsDestination:
                     mutation_id=deletion.mutation_id,
                     status="failed",
                     error=error_for_status(
-                        response.status_code,
+                        response,
                         mutation_id=deletion.mutation_id,
                         correlation_id=correlation_id,
                     ),
@@ -1132,7 +1162,7 @@ class GitHubActionsDestination:
                     mutation_id=deletion.mutation_id,
                     status="failed",
                     error=error_for_status(
-                        response.status_code,
+                        response,
                         mutation_id=deletion.mutation_id,
                         correlation_id=correlation_id,
                     ),

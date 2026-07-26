@@ -79,13 +79,13 @@ deployments:
 
   # Org secrets/variables: org is destination.organization, or the owner of
   # repository (acme from acme/web). Org-only destinations work for this scope.
-  # Token needs admin:org (classic PAT). visibility defaults to private.
+  # Token needs admin:org (classic PAT). visibility is required.
   - name: github-org
     set: production
     destination: github
     scope:
       kind: organization
-      visibility: private # all | private | selected (+ selected_repository_ids)
+      visibility: private # required: all | private | selected (+ selectedRepositoryIds)
     secrets:
       apiKey: API_KEY
     variables:
@@ -104,8 +104,8 @@ Vercel destination modes (selected by `scope.kind`):
 destinations:
   vercel:
     connector: vercel
-    teamId: team_xyz          # required
-    project: prj_abc          # optional; required for kind: environment
+    teamId: team_xyz # required
+    project: prj_abc # optional; required for kind: environment
     auth:
       tokenEnv: VERCEL_TOKEN
 
@@ -124,7 +124,7 @@ deployments:
     scope:
       kind: shared-environment
       targets: [production]
-      projects: [prj_abc, prj_def]  # optional link set
+      projects: [prj_abc, prj_def] # optional link set
     secrets:
       sharedSecret: SHARED_SECRET
 ```
@@ -175,6 +175,8 @@ op run --env-file=.env.tpl -- secretsync --destination github plan
 Useful flags: `--config`, `--format json`, `--verbose`, `--quiet`, `--deployment`, `--destination`, `--prune`.
 
 With `--prune`, SecretSync lists remote names at plan time (secrets and variables separately) and treats YAML as the full desired inventory for each destination scope + kind — remote entries not listed in the config are planned for deletion. Without `--prune`, apply is put-only.
+
+For Vercel, a remote env var belongs to a deployment only when its target set **exactly** matches `scope.targets` (and, for shared env, `scope.projects`). A multi-target remote such as `[production, preview]` is owned by a deployment that declares that same multi-target scope — not by a production-only or preview-only sibling.
 
 ## Supported Destinations
 

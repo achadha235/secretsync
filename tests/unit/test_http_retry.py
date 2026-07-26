@@ -4,7 +4,12 @@ import httpx
 import pytest
 import respx
 
-from secretsync.infrastructure.http import HttpRequestError, request_with_retries
+from secretsync.infrastructure.http import (
+    HttpRequestError,
+    error_for_status,
+    provider_error_detail,
+    request_with_retries,
+)
 
 
 @pytest.mark.asyncio
@@ -35,7 +40,9 @@ async def test_non_retryable_401_returns_immediately() -> None:
 @pytest.mark.asyncio
 @respx.mock
 async def test_exhausted_retries_raise_rate_limited() -> None:
-    respx.get("https://example.test/limited").mock(return_value=httpx.Response(429))
+    respx.get("https://example.test/limited").mock(
+        return_value=httpx.Response(429, json={"message": "slow down"})
+    )
     async with httpx.AsyncClient() as client:
         with pytest.raises(HttpRequestError) as exc:
             await request_with_retries(
@@ -45,6 +52,7 @@ async def test_exhausted_retries_raise_rate_limited() -> None:
                 max_attempts=3,
             )
     assert exc.value.safe.code == "DESTINATION_RATE_LIMITED"
+    assert "slow down" in exc.value.safe.message
 
 
 @pytest.mark.asyncio
@@ -55,3 +63,32 @@ async def test_400_not_retried() -> None:
         response = await request_with_retries(client, "POST", "https://example.test/bad")
     assert response.status_code == 400
     assert route.call_count == 1
+
+
+def test_error_for_status_includes_github_message() -> None:
+    response = httpx.Response(
+        404,
+        json={"message": "Not Found", "documentation_url": "https://docs.github.com"},
+        request=httpx.Request("PUT", "https://api.github.com/orgs/acme/actions/secrets/X"),
+    )
+    err = error_for_status(response, correlation_id="c1")
+    assert err.code == "DESTINATION_INVALID"
+    assert err.message == "Provider rejected request (HTTP 404): Not Found"
+
+
+def test_error_for_status_includes_vercel_error() -> None:
+    response = httpx.Response(
+        400,
+        json={"error": {"code": "bad_request", "message": "Invalid key"}},
+        request=httpx.Request("POST", "https://api.vercel.com/v10/projects/p/env"),
+    )
+    err = error_for_status(response)
+    assert "bad_request: Invalid key" in err.message
+
+
+def test_provider_error_detail_redacts_secrets() -> None:
+    response = httpx.Response(400, json={"message": "value sk_live_x is invalid"})
+    detail = provider_error_detail(response, secrets=["sk_live_x"])
+    assert detail is not None
+    assert "sk_live_x" not in detail
+    assert "***" in detail

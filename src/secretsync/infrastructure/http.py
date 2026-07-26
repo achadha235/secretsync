@@ -1,19 +1,25 @@
-"""httpx client factory with safe retries and no wire logging."""
+"""httpx client factory with safe retries and bounded provider-error diagnostics."""
 
 from __future__ import annotations
 
 import asyncio
 import random
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
+from loguru import logger
 
-from secretsync.destinations.base import SafeConnectorError
-from secretsync.infrastructure.redaction import SENSITIVE_HEADER_NAMES
+from secretsync.domain.errors import SafeError
+from secretsync.infrastructure.redaction import SENSITIVE_HEADER_NAMES, sanitize_provider_message
 
 RETRYABLE_STATUS = frozenset({429, 502, 503, 504})
 DEFAULT_MAX_ATTEMPTS = 5
+BOUNDED_PROVIDER_ERROR = 512
+
+# Spec alias: connector-facing errors are SafeError payloads.
+SafeConnectorError = SafeError
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,34 +58,94 @@ def response_debug_meta(response: httpx.Response) -> dict[str, object]:
     }
 
 
+def provider_error_detail(
+    response: httpx.Response,
+    secrets: Sequence[str] | None = None,
+) -> str | None:
+    """Bounded, redacted provider error text for SafeError / audit / verbose logs."""
+    raw = (response.text or "")[: BOUNDED_PROVIDER_ERROR * 2]
+    if not raw.strip():
+        return None
+
+    detail: str | None = None
+    try:
+        payload = response.json()
+    except (ValueError, httpx.DecodingError):
+        payload = None
+
+    if isinstance(payload, dict):
+        message = payload.get("message")
+        if isinstance(message, str) and message.strip():
+            detail = message.strip()
+        else:
+            error = payload.get("error")
+            if isinstance(error, dict):
+                bits: list[str] = []
+                code = error.get("code")
+                emsg = error.get("message")
+                if isinstance(code, str) and code.strip():
+                    bits.append(code.strip())
+                if isinstance(emsg, str) and emsg.strip():
+                    bits.append(emsg.strip())
+                if bits:
+                    detail = ": ".join(bits)
+            elif isinstance(error, str) and error.strip():
+                detail = error.strip()
+
+    if detail is None:
+        detail = " ".join(raw.split())
+
+    detail = sanitize_provider_message(detail, list(secrets) if secrets else None)
+    if len(detail) > BOUNDED_PROVIDER_ERROR:
+        detail = detail[:BOUNDED_PROVIDER_ERROR] + "…"
+    return detail or None
+
+
 def error_for_status(
-    status_code: int,
+    response_or_status: httpx.Response | int,
     *,
     mutation_id: str | None = None,
     correlation_id: str | None = None,
+    secrets: Sequence[str] | None = None,
 ) -> SafeConnectorError:
+    if isinstance(response_or_status, int):
+        status_code = response_or_status
+        response: httpx.Response | None = None
+        detail: str | None = None
+    else:
+        response = response_or_status
+        status_code = response.status_code
+        detail = provider_error_detail(response, secrets)
+
+    if response is not None:
+        method = response.request.method if response.request else "?"
+        logger.debug(
+            "provider HTTP {} {} -> {}{}",
+            method,
+            response.url,
+            status_code,
+            f": {detail}" if detail else "",
+        )
+
     if status_code in {401, 403}:
-        return SafeConnectorError(
-            code="DESTINATION_PERMISSION_DENIED",
-            message=f"Provider rejected authorization (HTTP {status_code})",
-            mutation_id=mutation_id,
-            correlation_id=correlation_id,
-            retryable=False,
-        )
-    if status_code == 429:
-        return SafeConnectorError(
-            code="DESTINATION_RATE_LIMITED",
-            message="Provider rate limit remained after bounded retry",
-            mutation_id=mutation_id,
-            correlation_id=correlation_id,
-            retryable=True,
-        )
+        base = f"Provider rejected authorization (HTTP {status_code})"
+        code = "DESTINATION_PERMISSION_DENIED"
+        retryable = False
+    elif status_code == 429:
+        base = "Provider rate limit remained after bounded retry"
+        code = "DESTINATION_RATE_LIMITED"
+        retryable = True
+    else:
+        base = f"Provider rejected request (HTTP {status_code})"
+        code = "DESTINATION_INVALID"
+        retryable = False
+
     return SafeConnectorError(
-        code="DESTINATION_INVALID",
-        message=f"Provider rejected request (HTTP {status_code})",
+        code=code,
+        message=f"{base}: {detail}" if detail else base,
         mutation_id=mutation_id,
         correlation_id=correlation_id,
-        retryable=False,
+        retryable=retryable,
     )
 
 
@@ -132,7 +198,7 @@ async def request_with_retries(
     if last_response is not None:
         raise HttpRequestError(
             error_for_status(
-                last_response.status_code,
+                last_response,
                 mutation_id=mutation_id,
                 correlation_id=correlation_id,
             )

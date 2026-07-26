@@ -65,3 +65,27 @@ def test_apply_writes_mutation_audit_without_values(tmp_path) -> None:
     assert "name=DATABASE_URL" in log
     assert "name=STRIPE_SECRET_KEY" in log
     assert "name=API_TOKEN" in log
+
+
+def test_apply_writes_failed_mutation_error_message(tmp_path) -> None:
+    from secretsync.infrastructure.audit import record_mutation_audit
+
+    path = record_mutation_audit(
+        config_path=None,
+        run_id="runfail00001",
+        destination_id="github-org",
+        connector_id="github-actions",
+        deployment_id="production",
+        op="put",
+        name="SECRET_THREE_ORG",
+        scope={"kind": "organization", "visibility": "all"},
+        status="failed",
+        effect=None,
+        correlation_id="corr-1",
+        error_code="DESTINATION_INVALID",
+        error_message="Provider rejected request (HTTP 404): Not Found",
+        cwd=tmp_path,
+    )
+    line = path.read_text(encoding="utf-8").strip()
+    assert 'error_message="Provider rejected request (HTTP 404): Not Found"' in line
+    assert "error=DESTINATION_INVALID" in line
