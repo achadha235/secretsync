@@ -19,18 +19,30 @@ def render_validation_human(result: ValidationResult) -> str:
 
 
 def render_plan_human(plan: Plan) -> str:
+    if plan.puts:
+        headline = "Every listed target will be written. Values are never displayed."
+    else:
+        headline = "Every listed remote name will be deleted. Values are never displayed."
     lines = [
         "SecretSync plan (always-write)",
-        "Every listed target will be written. Values are never displayed.",
+        headline,
         f"Strategy: {plan.strategy}",
         f"Puts: {len(plan.puts)}  Deletes: {len(plan.deletes)}",
         "",
     ]
-    if plan.deletes:
+    if plan.deletes and plan.puts:
         lines.extend(
             [
                 "WARNING: --prune treats YAML as the full desired inventory for each",
                 "destination scope. Remote secrets not listed in YAML will be deleted.",
+                "",
+            ]
+        )
+    elif plan.deletes and not plan.puts:
+        lines.extend(
+            [
+                "WARNING: clear deletes every remote secret/variable listed below",
+                "for each selected deployment scope.",
                 "",
             ]
         )

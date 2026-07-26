@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import pytest
 
-from secretsync.application.plan import build_plan, build_plan_async, plan_from_path
+from secretsync.application.apply import run_clear
+from secretsync.application.plan import (
+    build_clear_plan_async,
+    build_plan,
+    build_plan_async,
+    plan_from_path,
+)
 from secretsync.application.services import create_services
 from secretsync.application.validate import validate_config
 from secretsync.config.compose import compose_from_config
@@ -37,6 +43,74 @@ async def test_prune_plans_orphan_deletes() -> None:
     assert len(plan.deletes) == 1
     assert plan.deletes[0].target.name == "ORPHAN_SECRET"
     assert "ORPHAN_SECRET" not in {p.target.name for p in plan.puts}
+
+
+@pytest.mark.asyncio
+async def test_clear_plans_all_remote_deletes() -> None:
+    services = create_services({})  # no source secrets required
+    config = ConfigLoader().load(fixture_path("fake_prune.yaml"))
+    factory = services.connectors._factories["fake-prune"]
+    assert isinstance(factory, FakePruneFactory)
+    scope = {"stage": "production"}
+    factory.remote_names[_scope_key(scope)] = {
+        "DATABASE_URL",
+        "STRIPE_SECRET_KEY",
+        "ORPHAN_SECRET",
+    }
+
+    plan = await build_clear_plan_async(services, config)
+    assert plan.puts == ()
+    assert {d.target.name for d in plan.deletes} == {
+        "DATABASE_URL",
+        "STRIPE_SECRET_KEY",
+        "ORPHAN_SECRET",
+    }
+
+
+def test_clear_skips_source_env_check() -> None:
+    services = create_services({})
+    result = validate_config(
+        services,
+        fixture_path("fake_prune.yaml"),
+        require_sources=False,
+    )
+    assert result.ok
+
+
+def test_run_clear_declined() -> None:
+    services = create_services({})
+    factory = services.connectors._factories["fake-prune"]
+    assert isinstance(factory, FakePruneFactory)
+    scope = {"stage": "production"}
+    factory.remote_names[_scope_key(scope)] = {"DATABASE_URL", "ORPHAN"}
+    report = run_clear(
+        services,
+        config_path=fixture_path("fake_prune.yaml"),
+        max_concurrency=2,
+        confirm_fn=lambda _prompt: False,
+    )
+    assert report.exit_code == 0
+    assert report.summary.applied == 0
+    assert report.destinations == ()
+    assert factory.remote_names[_scope_key(scope)] == {"DATABASE_URL", "ORPHAN"}
+
+
+def test_run_clear_applies_deletes() -> None:
+    services = create_services({})
+    factory = services.connectors._factories["fake-prune"]
+    assert isinstance(factory, FakePruneFactory)
+    scope = {"stage": "production"}
+    factory.remote_names[_scope_key(scope)] = {"DATABASE_URL", "ORPHAN"}
+    report = run_clear(
+        services,
+        config_path=fixture_path("fake_prune.yaml"),
+        max_concurrency=2,
+        confirm_fn=lambda _prompt: True,
+    )
+    assert report.exit_code == 0
+    assert report.summary.applied == 2
+    assert report.summary.failed == 0
+    assert factory.remote_names[_scope_key(scope)] == set()
 
 
 @pytest.mark.asyncio

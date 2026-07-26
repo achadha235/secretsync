@@ -11,7 +11,7 @@ import anyio
 import click
 from loguru import logger
 
-from secretsync.application.apply import run_apply
+from secretsync.application.apply import run_apply, run_clear
 from secretsync.application.health import (
     HealthReport,
     health_token_envs_from_config,
@@ -263,6 +263,36 @@ def apply_cmd(ctx: AppContext, yes: bool, max_concurrency: int, prune: bool) -> 
         extra=(
             selection_extra(ctx.deployments, ctx.destinations)
             + f" applied={report.summary.applied} failed={report.summary.failed} prune={prune}"
+        ),
+        run_id=ctx.run_id,
+    )
+    raise SystemExit(report.exit_code)
+
+
+@cli.command("clear")
+@click.option("--max-concurrency", type=click.IntRange(1, 32), default=4, show_default=True)
+@click.pass_obj
+def clear_cmd(ctx: AppContext, max_concurrency: int) -> None:
+    """Delete all remote secrets/variables for configured deployment scopes."""
+    report = run_clear(
+        ctx.services,
+        config_path=ctx.config_path,
+        max_concurrency=max_concurrency,
+        deployments=_dep_set(ctx),
+        destinations=_dest_set(ctx),
+        run_id=ctx.run_id,
+    )
+    if ctx.output_format == "json":
+        click.echo(render_apply_json(report))
+    else:
+        click.echo(render_apply_human(report))
+    record_audit(
+        command="clear",
+        config_path=ctx.config_path if ctx.config_path.exists() else None,
+        exit_code=report.exit_code,
+        extra=(
+            selection_extra(ctx.deployments, ctx.destinations)
+            + f" applied={report.summary.applied} failed={report.summary.failed}"
         ),
         run_id=ctx.run_id,
     )

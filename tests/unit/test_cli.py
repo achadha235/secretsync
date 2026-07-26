@@ -20,6 +20,31 @@ def test_help() -> None:
     assert result.exit_code == 0
     assert "validate" in result.output
     assert "plan" in result.output
+    assert "clear" in result.output
+
+
+def test_clear_cli_requires_exact_phrase() -> None:
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["--config", str(fixture_path("fake_prune.yaml")), "clear"],
+        input="nope\n",
+        env={},
+    )
+    assert result.exit_code == 0
+    assert "confirm clear operation" in result.output
+
+
+def test_clear_cli_with_phrase() -> None:
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["--config", str(fixture_path("fake_prune.yaml")), "clear"],
+        input="confirm clear operation\n",
+        env={},
+    )
+    assert result.exit_code == 0
+    assert "applied=0" in result.output
 
 
 def test_validate_cli_ok() -> None:

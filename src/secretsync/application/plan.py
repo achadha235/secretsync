@@ -112,6 +112,53 @@ async def build_plan_async(
     from secretsync.application.selection import filter_deployments
 
     selected = filter_deployments(config, deployments=deployments, destinations=destinations)
+    deletes = await _plan_remote_deletes(
+        services,
+        config,
+        selected,
+        clear=False,
+        capability_label="prune",
+        capability_hint=(
+            "Omit --prune for this destination, or use a connector that supports it."
+        ),
+    )
+    return Plan(strategy="always-write", puts=plan.puts, deletes=tuple(deletes))
+
+
+async def build_clear_plan_async(
+    services: AppServices,
+    config: RootConfig,
+    *,
+    deployments: set[str] | None = None,
+    destinations: set[str] | None = None,
+) -> Plan:
+    """List remotes for selected deployments and plan deletes for every remote name."""
+    from secretsync.application.selection import filter_deployments
+
+    selected = filter_deployments(config, deployments=deployments, destinations=destinations)
+    deletes = await _plan_remote_deletes(
+        services,
+        config,
+        selected,
+        clear=True,
+        capability_label="clear",
+        capability_hint=(
+            "Use a connector with list_names + delete, or narrow --destination/--deployment."
+        ),
+    )
+    return Plan(strategy="always-write", puts=(), deletes=tuple(deletes))
+
+
+async def _plan_remote_deletes(
+    services: AppServices,
+    config: RootConfig,
+    selected: list[DeploymentDefinition],
+    *,
+    clear: bool,
+    capability_label: str,
+    capability_hint: str,
+) -> list[PlannedDelete]:
+    """List remotes per inventory unit; delete all (clear) or orphans only (prune)."""
     units = _inventory_units(config, selected)
     deletes: list[PlannedDelete] = []
     for unit in units:
@@ -124,11 +171,11 @@ async def build_plan_async(
                     code="DESTINATION_INVALID",
                     message=(
                         f"Destination '{unit.destination_id}' "
-                        f"[{unit.connector_id}] does not support prune "
+                        f"[{unit.connector_id}] does not support {capability_label} "
                         "(list_names + delete required)"
                     ),
                     destination_id=unit.destination_id,
-                    hint="Omit --prune for this destination, or use a connector that supports it.",
+                    hint=capability_hint,
                 )
             )
         dest_config = _destination_config_map(destination)
@@ -151,9 +198,9 @@ async def build_plan_async(
                     retryable=exc.safe.retryable,
                 )
             ) from exc
-        orphans = sorted(remote - unit.intended_names)
+        names = sorted(remote) if clear else sorted(remote - unit.intended_names)
         owner_deployment = unit.deployment_ids[0]
-        for name in orphans:
+        for name in names:
             deletes.append(
                 PlannedDelete(
                     mutation_id=stable_delete_mutation_id(
@@ -169,7 +216,7 @@ async def build_plan_async(
                     kind=unit.kind,
                 )
             )
-    return Plan(strategy="always-write", puts=plan.puts, deletes=tuple(deletes))
+    return deletes
 
 
 def _inventory_units(
