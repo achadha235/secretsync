@@ -450,10 +450,12 @@ def _clear_confirm(prompt: str) -> bool:
     import click
 
     click.echo(prompt)
-    typed = click.prompt(
-        f'Type "{CLEAR_CONFIRM_PHRASE}" to proceed',
-        default="",
-        show_default=False,
+    typed = str(
+        click.prompt(
+            f'Type "{CLEAR_CONFIRM_PHRASE}" to proceed',
+            default="",
+            show_default=False,
+        )
     )
     return typed == CLEAR_CONFIRM_PHRASE
 
