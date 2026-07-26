@@ -50,6 +50,7 @@ def validate_config(
     *,
     deployments: set[str] | None = None,
     destinations: set[str] | None = None,
+    require_sources: bool = True,
 ) -> ValidationResult:
     """Run offline validation phases. Never resolves secret values."""
     try:
@@ -60,6 +61,7 @@ def validate_config(
             config,
             deployments=deployments,
             destinations=destinations,
+            require_sources=require_sources,
         )
     except SecretSyncError as exc:
         logger.error("{}", exc.safe.message)
@@ -77,6 +79,7 @@ def validate_loaded(
     *,
     deployments: set[str] | None = None,
     destinations: set[str] | None = None,
+    require_sources: bool = True,
 ) -> ValidationResult:
     try:
         _require_supported_strategy(config.change_detection)
@@ -88,7 +91,13 @@ def validate_loaded(
             ", ".join(d.name for d in selected),
         )
         _validate_deployments(config, composed, services.connectors, services, selected)
-        _check_environment_presence(config, composed, services.environ, selected)
+        _check_environment_presence(
+            config,
+            composed,
+            services.environ,
+            selected,
+            require_sources=require_sources,
+        )
         return ValidationResult(
             config=config,
             composed_sets=composed,
@@ -291,6 +300,8 @@ def _check_environment_presence(
     composed: dict[str, ComposedSet],
     environ: Mapping[str, str],
     selected: Sequence[DeploymentDefinition],
+    *,
+    require_sources: bool = True,
 ) -> None:
     required_source: set[str] = set()
     required_auth: dict[str, str] = {}  # token_env -> dest_id
@@ -310,10 +321,11 @@ def _check_environment_presence(
         if token_env:
             required_auth[token_env] = deployment.destination
 
-    logger.debug("Required source env vars: {}", sorted(required_source))
-    for env_name in sorted(required_source):
-        if env_name not in environ:
-            raise SourceMissingError(env_name)
+    if require_sources:
+        logger.debug("Required source env vars: {}", sorted(required_source))
+        for env_name in sorted(required_source):
+            if env_name not in environ:
+                raise SourceMissingError(env_name)
 
     for token_env, dest_id in sorted(required_auth.items()):
         if token_env not in environ:

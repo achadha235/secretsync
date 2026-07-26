@@ -14,7 +14,7 @@ from typing import Any, Literal
 import anyio
 from loguru import logger
 
-from secretsync.application.plan import build_plan_async
+from secretsync.application.plan import build_clear_plan_async, build_plan_async
 from secretsync.application.services import AppServices
 from secretsync.application.validate import ValidationIssue, validate_config
 from secretsync.config.models import RootConfig
@@ -42,6 +42,8 @@ from secretsync.domain.errors import (
 from secretsync.domain.models import JsonValue, Plan, PlannedDelete, PlannedPut
 from secretsync.infrastructure.audit import new_run_id, record_mutation_audit
 from secretsync.infrastructure.redaction import scrub_bytearray
+
+CLEAR_CONFIRM_PHRASE = "confirm clear operation"
 
 
 @dataclass(frozen=True, slots=True)
@@ -279,6 +281,183 @@ def _default_confirm(prompt: str) -> bool:
 
     click.echo(prompt)
     return bool(click.confirm("Continue?", default=False))
+
+
+def run_clear(
+    services: AppServices,
+    *,
+    config_path: Path,
+    max_concurrency: int,
+    confirm_fn: ConfirmFn | None = None,
+    deployments: set[str] | None = None,
+    destinations: set[str] | None = None,
+    run_id: str | None = None,
+) -> ApplyReport:
+    """Delete all remote secrets/variables for selected deployment scopes."""
+
+    async def _runner() -> ApplyReport:
+        return await run_clear_async(
+            services,
+            config_path,
+            max_concurrency=max_concurrency,
+            confirm_fn=confirm_fn,
+            deployments=deployments,
+            destinations=destinations,
+            run_id=run_id,
+        )
+
+    return anyio.run(_runner)
+
+
+async def run_clear_async(
+    services: AppServices,
+    config_path: Path,
+    *,
+    max_concurrency: int,
+    confirm_fn: ConfirmFn | None = None,
+    deployments: set[str] | None = None,
+    destinations: set[str] | None = None,
+    run_id: str | None = None,
+) -> ApplyReport:
+    started = services.clock.now()
+    validation = validate_config(
+        services,
+        config_path,
+        deployments=deployments,
+        destinations=destinations,
+        require_sources=False,
+    )
+    if not validation.ok or validation.config is None:
+        issue = validation.issues[0] if validation.issues else None
+        return ApplyReport(
+            exit_code=validation.exit_code,
+            started_at=started,
+            completed_at=services.clock.now(),
+            error=(
+                SafeError(
+                    code=issue.code if issue else "CONFIG_INVALID",
+                    message=issue.message if issue else "Validation failed",
+                    hint=issue.hint if issue else None,
+                )
+            ),
+        )
+
+    config = validation.config
+    selected_dest_ids = {
+        d.destination for d in config.deployments if d.name in set(validation.selected_deployments)
+    }
+    try:
+        connector_issues = await _static_validate_connectors(
+            services, config, destination_ids=selected_dest_ids or None
+        )
+    except SecretSyncError as exc:
+        return ApplyReport(
+            exit_code=exit_code_for(exc),
+            started_at=started,
+            completed_at=services.clock.now(),
+            error=exc.safe,
+        )
+    if connector_issues:
+        first = connector_issues[0]
+        return ApplyReport(
+            exit_code=EXIT_CONNECTOR_VALIDATION,
+            started_at=started,
+            completed_at=services.clock.now(),
+            error=SafeError(
+                code=first.code,
+                message=first.message,
+                hint=first.hint,
+            ),
+        )
+
+    try:
+        plan = await build_clear_plan_async(
+            services,
+            config,
+            deployments=deployments,
+            destinations=destinations,
+        )
+    except SecretSyncError as exc:
+        return ApplyReport(
+            exit_code=exit_code_for(exc),
+            started_at=started,
+            completed_at=services.clock.now(),
+            error=exc.safe,
+        )
+    logger.info("Clear plan has {} delete(s)", len(plan.deletes))
+
+    from secretsync.presentation.human import render_plan_human
+
+    prompt = (
+        render_plan_human(plan)
+        + "\n\nWARNING: clear deletes every remote secret/variable in the listed scopes."
+    )
+    accepted = (confirm_fn or _clear_confirm)(prompt)
+    if not accepted:
+        return ApplyReport(
+            exit_code=EXIT_OK,
+            strategy=plan.strategy,
+            started_at=started,
+            completed_at=services.clock.now(),
+            summary=ApplySummary(0, 0, len(plan.deletes)),
+        )
+
+    audit_run = run_id or new_run_id()
+    try:
+        blocks = await _apply_plan(
+            services,
+            config,
+            plan,
+            max_concurrency,
+            config_path=config_path,
+            run_id=audit_run,
+        )
+    except (anyio.get_cancelled_exc_class(), asyncio.CancelledError):
+        return ApplyReport(
+            exit_code=EXIT_INTERRUPTED,
+            strategy=plan.strategy,
+            started_at=started,
+            completed_at=services.clock.now(),
+            cancelled=True,
+            error=SafeError(
+                code="CONFIG_INVALID",
+                message="Clear interrupted; completed deletes were not rolled back",
+            ),
+        )
+    except SecretSyncError as exc:
+        return ApplyReport(
+            exit_code=exit_code_for(exc),
+            strategy=plan.strategy,
+            started_at=started,
+            completed_at=services.clock.now(),
+            error=exc.safe,
+        )
+
+    plan_dest_order = _destination_order(plan)
+    ordered = tuple(sorted(blocks, key=lambda b: (plan_dest_order.get(b.id, 10_000), b.id)))
+    summary = _summarize(ordered)
+    return ApplyReport(
+        exit_code=_exit_for_summary(summary),
+        strategy=plan.strategy,
+        started_at=started,
+        completed_at=services.clock.now(),
+        summary=summary,
+        destinations=ordered,
+    )
+
+
+def _clear_confirm(prompt: str) -> bool:
+    import click
+
+    click.echo(prompt)
+    typed = str(
+        click.prompt(
+            f'Type "{CLEAR_CONFIRM_PHRASE}" to proceed',
+            default="",
+            show_default=False,
+        )
+    )
+    return typed == CLEAR_CONFIRM_PHRASE
 
 
 async def _static_validate_connectors(
