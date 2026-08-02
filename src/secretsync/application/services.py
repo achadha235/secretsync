@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from secretsync.config.loader import ConfigLoader
+from secretsync.destinations.aws_ssm import AwsSsmFactory
 from secretsync.destinations.fake import builtin_fake_factories
 from secretsync.destinations.github_actions import GitHubActionsFactory
 from secretsync.destinations.registry import ConnectorRegistry
@@ -42,6 +43,7 @@ def create_services(environ: Mapping[str, str]) -> AppServices:
         GitHubActionsFactory(),
         VercelFactory(),
         SstFactory(),
+        AwsSsmFactory(),
     ]
     return AppServices(
         config_loader=ConfigLoader(),
