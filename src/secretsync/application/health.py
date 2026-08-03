@@ -6,7 +6,9 @@ import shutil
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
+import anyio
 import httpx
 from loguru import logger
 
@@ -46,6 +48,7 @@ async def run_health(
     results.append(await _check_github(environ, github_token_env))
     results.append(await _check_vercel(environ, vercel_token_env))
     results.append(await _check_aws(environ))
+    results.append(await _check_aws_ssm_boto(environ))
     return HealthReport(results=tuple(results))
 
 
@@ -103,11 +106,15 @@ async def _check_vercel(environ: Mapping[str, str], token_env: str) -> HealthChe
         )
 
 
-async def _check_aws(environ: Mapping[str, str]) -> HealthCheckResult:
-    name = "SST / AWS"
+def _aws_credentials_present(environ: Mapping[str, str]) -> bool:
     has_profile = bool(environ.get("AWS_PROFILE"))
     has_keys = bool(environ.get("AWS_ACCESS_KEY_ID") and environ.get("AWS_SECRET_ACCESS_KEY"))
-    if not has_profile and not has_keys:
+    return has_profile or has_keys
+
+
+async def _check_aws(environ: Mapping[str, str]) -> HealthCheckResult:
+    name = "SST / AWS"
+    if not _aws_credentials_present(environ):
         msg = (
             "AWS_PROFILE (or AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY) not set, "
             "skipping check for SST connector"
@@ -154,6 +161,54 @@ async def _check_aws(environ: Mapping[str, str]) -> HealthCheckResult:
         status="fail",
         message=f"SST / AWS: FAIL (exit {result.exit_code})",
     )
+
+
+async def _check_aws_ssm_boto(environ: Mapping[str, str]) -> HealthCheckResult:
+    """Optional boto3 STS probe for the aws-ssm connector."""
+    name = "AWS SSM (boto3)"
+    if not _aws_credentials_present(environ):
+        msg = (
+            "AWS_PROFILE (or AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY) not set, "
+            "skipping check for aws-ssm connector"
+        )
+        logger.info(msg)
+        return HealthCheckResult(name=name, status="skip", message=msg)
+
+    try:
+        import boto3  # type: ignore[import-untyped]
+    except ImportError:
+        msg = (
+            "boto3 not installed, skipping check for aws-ssm connector "
+            "(install secretsync-cli[aws] or [all])"
+        )
+        logger.info(msg)
+        return HealthCheckResult(name=name, status="skip", message=msg)
+
+    region = environ.get("AWS_REGION") or environ.get("AWS_DEFAULT_REGION")
+    kwargs: dict[str, Any] = {}
+    if region:
+        kwargs["region_name"] = region
+    logger.debug("Running boto3 sts get_caller_identity for aws-ssm health")
+    try:
+        client = boto3.client("sts", **kwargs)
+
+        def _probe() -> Any:
+            return client.get_caller_identity()
+
+        identity = await anyio.to_thread.run_sync(_probe)
+        if identity.get("Account"):
+            return HealthCheckResult(name=name, status="ok", message="AWS SSM (boto3): OK")
+        return HealthCheckResult(
+            name=name,
+            status="fail",
+            message="AWS SSM (boto3): FAIL (empty identity)",
+        )
+    except Exception as exc:  # noqa: BLE001
+        return HealthCheckResult(
+            name=name,
+            status="fail",
+            message=f"AWS SSM (boto3): FAIL ({type(exc).__name__})",
+        )
 
 
 def health_token_envs_from_config(config_path: Path, environ: Mapping[str, str]) -> tuple[str, str]:

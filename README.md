@@ -8,7 +8,7 @@ Local-first CLI that pushes secrets from your vault-backed environment into depl
 
 Vaults solve storage, rotation, access control, and audit. The gap is **delivery**: getting the same secret into GitHub Actions, Vercel, and SST without paste-into-Slack, clipboard history, or hand-copying the same key into three dashboards — and without half-rotated deploys when one destination is forgotten.
 
-SecretSync is a thin CLI for that gap. You declare routing in a checked-in YAML file (reviewable in PRs; plaintext stays out of git), inject values from your vault into the process environment (`op run`, Doppler, etc.), and push. Destination quirks — GitHub repo/environment/org scopes, Vercel deployment targets, SST stages — stay behind connectors so the config stays simple.
+SecretSync is a thin CLI for that gap. You declare routing in a checked-in YAML file (reviewable in PRs; plaintext stays out of git), inject values from your vault into the process environment (`op run`, Doppler, etc.), and push. Destination quirks — GitHub repo/environment/org scopes, Vercel deployment targets, SST stages, AWS SSM path prefixes — stay behind connectors so the config stays simple.
 
 Full secrets platforms (Infisical and similar) can do this and more, but they are overkill when you already trust a vault and only need to say which names land where. Plaintext should only move through process memory, authenticated provider APIs, or one-shot env injection — never config, plans, logs, or temp files.
 
@@ -17,6 +17,11 @@ Full secrets platforms (Infisical and similar) can do this and more, but they ar
 ```bash
 ## Install with uv
 uv tool install secretsync-cli
+
+# Optional AWS connectors (Parameter Store via boto3):
+# uv tool install 'secretsync-cli[aws]'
+# Or every optional extra:
+# uv tool install 'secretsync-cli[all]'
 
 # Scaffold config + 1Password-style env template
 secretsync init
@@ -97,6 +102,30 @@ Kind is declared once under `secrets` or `variables`. Connectors map kind to the
 > **Breaking:** Vercel `scope.sensitive` is removed. Put sensitive values under `deployment.secrets` and plaintext under `deployment.variables`.
 >
 > **Breaking:** Vercel destinations require `teamId`. Project env deployments need `scope.kind: environment` (and destination `project`). Team shared env uses `scope.kind: shared-environment` with optional `scope.projects`.
+
+AWS SSM Parameter Store (requires `secretsync-cli[aws]` or `[all]`):
+
+```yaml
+destinations:
+  ssm:
+    connector: aws-ssm
+    region: us-east-1 # optional; else AWS_REGION / session default
+    # keyId: alias/aws/ssm  # optional KMS key for SecureString
+    # tier: Standard
+
+deployments:
+  - name: ssm-production
+    set: production
+    destination: ssm
+    scope:
+      pathPrefix: /myapp/production
+    secrets:
+      apiKey: API_KEY # → /myapp/production/API_KEY (SecureString)
+    variables:
+      logLevel: LOG_LEVEL # → /myapp/production/LOG_LEVEL (String)
+```
+
+Auth uses the standard AWS credential chain (`AWS_PROFILE` or `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`). No `auth.tokenEnv`.
 
 Vercel destination modes (selected by `scope.kind`):
 
@@ -185,6 +214,7 @@ We currently support these destinations.
 - [GitHub Actions](https://github.com/features/actions)
 - [Vercel](https://vercel.com/)
 - [SST](https://sst.dev/)
+- [AWS Systems Manager Parameter Store](https://docs.aws.amazon.com/systems-manager/latest/userguide/systems-manager-parameter-store.html) (`aws-ssm`; install `[aws]` or `[all]`)
 
 ## Audit
 

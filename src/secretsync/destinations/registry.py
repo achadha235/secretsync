@@ -14,6 +14,7 @@ PLANNED_CONNECTOR_IDS: frozenset[str] = frozenset(
         "github-actions",
         "vercel",
         "sst",
+        "aws-ssm",
     }
 )
 
