@@ -28,8 +28,7 @@ from secretsync.domain.models import JsonValue, ValueKind
 from secretsync.infrastructure.redaction import sanitize_provider_message
 
 BOTO3_INSTALL_HINT = (
-    "Install the AWS extra: pip install 'secretsync-cli[aws]' "
-    "(or 'secretsync-cli[all]')."
+    "Install the AWS extra: pip install 'secretsync-cli[aws]' (or 'secretsync-cli[all]')."
 )
 VALID_TIERS = frozenset({"Standard", "Advanced", "Intelligent-Tiering"})
 # Relative segment or multi-segment path (no leading slash). Full names validated after join.
@@ -183,9 +182,7 @@ def _config_issues(config: Mapping[str, JsonValue]) -> list[Issue]:
         issues.append(
             Issue(
                 code="DESTINATION_INVALID",
-                message=(
-                    f"aws-ssm tier must be one of: {', '.join(sorted(VALID_TIERS))}"
-                ),
+                message=(f"aws-ssm tier must be one of: {', '.join(sorted(VALID_TIERS))}"),
             )
         )
     return issues
