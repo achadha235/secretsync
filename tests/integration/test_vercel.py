@@ -95,7 +95,20 @@ async def test_secret_rejects_development_target() -> None:
     )
     assert result.results[0].status == "failed"
     assert result.results[0].error is not None
-    assert "sensitive" in result.results[0].error.message.lower()
+    assert "development" in result.results[0].error.message.lower()
+
+
+@pytest.mark.asyncio
+async def test_secret_allows_custom_staging_target() -> None:
+    """Sensitive vars may target custom environments (e.g. staging), not only production/preview."""
+    from secretsync.destinations.vercel import _validate_scope
+
+    err = _validate_scope(
+        {"kind": "environment", "targets": ["staging", "preview"]},
+        kind=ValueKind.SECRET,
+        destination_project="web",
+    )
+    assert err is None
 
 
 @pytest.mark.asyncio

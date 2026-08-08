@@ -30,7 +30,9 @@ API_PATH = "/v10/projects/{project}/env"
 SHARED_ENV_PATH = "/v1/env"
 DEFAULT_MAX_ITEMS = 100
 SHARED_MAX_ITEMS = 50
-SENSITIVE_TARGETS = frozenset({"production", "preview"})
+# Vercel disallows Sensitive env vars only on Development. Custom environments
+# (e.g. staging) and production/preview all allow sensitive.
+FORBIDDEN_SENSITIVE_TARGETS = frozenset({"development"})
 SCOPE_KIND_ENVIRONMENT = "environment"
 SCOPE_KIND_SHARED = "shared-environment"
 VALID_SCOPE_KINDS = frozenset({SCOPE_KIND_ENVIRONMENT, SCOPE_KIND_SHARED})
@@ -113,9 +115,12 @@ def _validate_scope(
             "vs deployment.variables so the connector sets type from kind"
         )
     if kind is ValueKind.SECRET:
-        illegal = [t for t in targets if t not in SENSITIVE_TARGETS]
+        illegal = [t for t in targets if t in FORBIDDEN_SENSITIVE_TARGETS]
         if illegal:
-            return "sensitive (secret) variables are limited to production and preview targets"
+            return (
+                "sensitive (secret) variables cannot target development "
+                "(use production, preview, or a custom environment)"
+            )
 
     git_branch = scope.get("gitBranch")
     projects = scope.get("projects")
