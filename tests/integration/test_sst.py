@@ -25,13 +25,14 @@ class RecordingRunner:
     calls: list[SecureProcessRequest] = field(default_factory=list)
     exit_code: int = 0
     stdout_bytes: bytes = b""
+    stderr_summary: str = ""
 
     async def execute(self, request: SecureProcessRequest) -> ProcessResult:
         self.calls.append(request)
         return ProcessResult(
             exit_code=self.exit_code,
             duration_ms=1,
-            stderr_summary="",
+            stderr_summary=self.stderr_summary,
             stdout_bytes=self.stdout_bytes if request.capture_stdout else b"",
         )
 
@@ -182,6 +183,88 @@ async def test_list_names_parses_dotenv_stdout(tmp_path: Path) -> None:
     assert runner.calls[0].capture_stdout is True
 
 
+_SECTIONED_LIST = b"""# fallback
+TEST_SECRET=meow
+
+# yellowbrick/staging
+STRIPE_API_KEY=meow
+YB_DATABASE_URL=meow
+"""
+
+
+@pytest.mark.asyncio
+async def test_list_names_excludes_fallback_section_for_stage_scope(tmp_path: Path) -> None:
+    runner = RecordingRunner(stdout_bytes=_SECTIONED_LIST)
+    dest = _dest(tmp_path, runner)
+    names = await dest.list_names(
+        {
+            "connector": "sst",
+            "workingDirectory": str(tmp_path),
+            "executable": "sst",
+        },
+        {"stage": "staging", "fallback": False},
+        OperationContext(correlation_id="c1"),
+    )
+    assert names == frozenset({"STRIPE_API_KEY", "YB_DATABASE_URL"})
+    assert "TEST_SECRET" not in names
+    assert "--fallback" not in runner.calls[0].arguments
+
+
+@pytest.mark.asyncio
+async def test_list_names_fallback_scope_returns_fallback_section_only(
+    tmp_path: Path,
+) -> None:
+    runner = RecordingRunner(stdout_bytes=_SECTIONED_LIST)
+    dest = _dest(tmp_path, runner)
+    names = await dest.list_names(
+        {
+            "connector": "sst",
+            "workingDirectory": str(tmp_path),
+            "executable": "sst",
+        },
+        {"stage": "staging", "fallback": True},
+        OperationContext(correlation_id="c1"),
+    )
+    assert names == frozenset({"TEST_SECRET"})
+    assert "--fallback" in runner.calls[0].arguments
+
+
+@pytest.mark.asyncio
+async def test_list_names_empty_inventory_is_not_failure(tmp_path: Path) -> None:
+    """SST exits non-zero with 'No secrets found' when inventory is empty."""
+    from secretsync.destinations.base import ListNamesError
+
+    runner = RecordingRunner(
+        exit_code=1,
+        stderr_summary="✕  No secrets found",
+    )
+    dest = _dest(tmp_path, runner)
+    names = await dest.list_names(
+        {
+            "connector": "sst",
+            "workingDirectory": str(tmp_path),
+            "executable": "sst",
+        },
+        {"stage": "staging", "fallback": True},
+        OperationContext(correlation_id="c1"),
+    )
+    assert names == frozenset()
+
+    runner_fail = RecordingRunner(exit_code=1, stderr_summary="network timeout")
+    dest_fail = _dest(tmp_path, runner_fail)
+    with pytest.raises(ListNamesError) as excinfo:
+        await dest_fail.list_names(
+            {
+                "connector": "sst",
+                "workingDirectory": str(tmp_path),
+                "executable": "sst",
+            },
+            {"stage": "staging", "fallback": False},
+            OperationContext(correlation_id="c1"),
+        )
+    assert "SST secret list failed" in excinfo.value.safe.message
+
+
 @pytest.mark.asyncio
 async def test_delete_calls_secret_remove(tmp_path: Path) -> None:
     from secretsync.destinations.base import DeleteMutation
@@ -211,3 +294,36 @@ async def test_delete_calls_secret_remove(tmp_path: Path) -> None:
     assert result.results[0].effect == "deleted"
     assert "remove" in runner.calls[0].arguments
     assert "Orphan" in runner.calls[0].arguments
+    assert "--fallback" not in runner.calls[0].arguments
+
+
+@pytest.mark.asyncio
+async def test_delete_fallback_passes_fallback_flag(tmp_path: Path) -> None:
+    from secretsync.destinations.base import DeleteMutation
+
+    runner = RecordingRunner()
+    dest = _dest(tmp_path, runner, probe_ok=False)
+    result = await dest.apply(
+        ApplyDestinationRequest(
+            deployment_id="dep",
+            destination_config={
+                "connector": "sst",
+                "workingDirectory": str(tmp_path),
+                "executable": "sst",
+            },
+            mutations=[],
+            deletes=[
+                DeleteMutation(
+                    mutation_id="dep:delete:TEST_SECRET",
+                    name="TEST_SECRET",
+                    scopes=({"stage": "staging", "fallback": True},),
+                )
+            ],
+        ),
+        OperationContext(correlation_id="c1"),
+    )
+    assert result.results[0].status == "applied"
+    assert result.results[0].effect == "deleted"
+    assert "remove" in runner.calls[0].arguments
+    assert "TEST_SECRET" in runner.calls[0].arguments
+    assert "--fallback" in runner.calls[0].arguments
