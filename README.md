@@ -115,7 +115,9 @@ deployments:
     destination: vercel
     scope:
       kind: environment
-      targets: [production]
+      # Builtins (production|preview|development) and/or custom environment slugs.
+      # Custom slugs (e.g. staging) are resolved to customEnvironmentIds via the API.
+      targets: [production, staging, preview]
     secrets:
       apiKey: API_KEY
   - name: vercel-shared
@@ -123,8 +125,9 @@ deployments:
     destination: vercel
     scope:
       kind: shared-environment
-      targets: [production]
-      projects: [prj_abc, prj_def] # optional link set
+      targets: [production, staging]
+      # Required when targets include custom slugs (resolved per project, IDs unioned).
+      projects: [prj_abc, prj_def]
     secrets:
       sharedSecret: SHARED_SECRET
 ```
@@ -176,7 +179,9 @@ Useful flags: `--config`, `--format json`, `--verbose`, `--quiet`, `--deployment
 
 With `--prune`, SecretSync lists remote names at plan time (secrets and variables separately) and treats YAML as the full desired inventory for each destination scope + kind — remote entries not listed in the config are planned for deletion. Without `--prune`, apply is put-only.
 
-For Vercel, a remote env var belongs to a deployment only when its target set **exactly** matches `scope.targets` (and, for shared env, `scope.projects`). A multi-target remote such as `[production, preview]` is owned by a deployment that declares that same multi-target scope — not by a production-only or preview-only sibling.
+For Vercel, a remote env var belongs to a deployment only when its target set **exactly** matches `scope.targets` (and, for shared env, `scope.projects`). Ownership compares normalized slug sets: remote `target` builtins plus slugs resolved from `customEnvironmentIds`. A multi-target remote such as `[production, preview]` is owned by a deployment that declares that same multi-target scope — not by a production-only or preview-only sibling. Create custom environments (Dashboard → Environments) before syncing their slugs.
+
+For SST, `sst secret list --stage …` may print both a `# fallback` section and a stage section. Prune ownership follows `scope.fallback`: stage deployments (`fallback: false`) own only stage-section names. When pruning an SST destination, SecretSync also inventories fallback secrets (via `scope.fallback: true`) and deletes orphans with `sst secret remove --fallback`. Declare intentional fallbacks on a `fallback: true` deployment so they are not pruned.
 
 ## Supported Destinations
 

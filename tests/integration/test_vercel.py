@@ -908,3 +908,187 @@ async def test_shared_delete() -> None:
     assert body == {"ids": ["env_orphan"]}
     assert result.results[0].status == "applied"
     assert result.results[0].effect == "deleted"
+
+
+def _mock_custom_envs(project: str, environments: list[dict[str, object]]) -> None:
+    respx.get(f"https://api.vercel.com/v9/projects/{project}/custom-environments").mock(
+        return_value=httpx.Response(
+            200,
+            json={"accountLimit": {"total": 10}, "environments": environments},
+        )
+    )
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_project_upsert_custom_staging_uses_custom_environment_ids() -> None:
+    """Custom slug `staging` must not appear in API `target` — only customEnvironmentIds."""
+    _mock_custom_envs(
+        "web",
+        [{"id": "env_staging", "slug": "staging", "type": "preview", "createdAt": 1, "updatedAt": 1}],
+    )
+    route = respx.post("https://api.vercel.com/v10/projects/web/env").mock(
+        return_value=httpx.Response(200, json={"created": []})
+    )
+    dest = VercelFactory().create(_services())
+    result = await dest.apply(
+        ApplyDestinationRequest(
+            deployment_id="dep",
+            destination_config=_dest_config(project="web"),  # type: ignore[arg-type]
+            mutations=[_mutation("STAGING_ONLY", targets=["staging"])],
+        ),
+        OperationContext(correlation_id="c1"),
+    )
+    assert result.results[0].status == "applied"
+    body = json.loads(route.calls[0].request.read())
+    assert len(body) == 1
+    assert "target" not in body[0]
+    assert body[0]["customEnvironmentIds"] == ["env_staging"]
+    assert "staging" not in json.dumps(body[0].get("target", []))
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_project_upsert_mixed_builtin_and_custom_targets() -> None:
+    _mock_custom_envs(
+        "web",
+        [{"id": "env_staging", "slug": "staging", "type": "preview", "createdAt": 1, "updatedAt": 1}],
+    )
+    route = respx.post("https://api.vercel.com/v10/projects/web/env").mock(
+        return_value=httpx.Response(200, json={"created": []})
+    )
+    dest = VercelFactory().create(_services())
+    result = await dest.apply(
+        ApplyDestinationRequest(
+            deployment_id="dep",
+            destination_config=_dest_config(project="web"),  # type: ignore[arg-type]
+            mutations=[
+                _mutation(
+                    "COMMON",
+                    targets=["production", "staging", "preview"],
+                )
+            ],
+        ),
+        OperationContext(correlation_id="c1"),
+    )
+    assert result.results[0].status == "applied"
+    body = json.loads(route.calls[0].request.read())[0]
+    assert set(body["target"]) == {"production", "preview"}
+    assert body["customEnvironmentIds"] == ["env_staging"]
+    assert "staging" not in body["target"]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_list_names_owns_custom_environment_id_rows() -> None:
+    _mock_custom_envs(
+        "web",
+        [{"id": "env_staging", "slug": "staging", "type": "preview", "createdAt": 1, "updatedAt": 1}],
+    )
+    respx.get("https://api.vercel.com/v9/projects/web/env").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "envs": [
+                    {
+                        "id": "1",
+                        "key": "STAGING_SECRET",
+                        "target": [],
+                        "customEnvironmentIds": ["env_staging"],
+                        "type": "sensitive",
+                    },
+                    {
+                        "id": "2",
+                        "key": "PROD_ONLY",
+                        "target": ["production"],
+                        "type": "sensitive",
+                    },
+                ]
+            },
+        )
+    )
+    dest = VercelFactory().create(_services())
+    names = await dest.list_names(
+        _dest_config(project="web"),  # type: ignore[arg-type]
+        {"kind": "environment", "targets": ["staging"]},  # type: ignore[arg-type]
+        OperationContext(correlation_id="c1"),
+        kind=ValueKind.SECRET,
+    )
+    assert names == frozenset({"STAGING_SECRET"})
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_shared_create_unions_custom_env_ids_across_projects() -> None:
+    _mock_custom_envs(
+        "prj_a",
+        [
+            {
+                "id": "env_cw_staging",
+                "slug": "staging",
+                "type": "preview",
+                "createdAt": 1,
+                "updatedAt": 1,
+            }
+        ],
+    )
+    _mock_custom_envs(
+        "prj_b",
+        [
+            {
+                "id": "env_yb_staging",
+                "slug": "staging",
+                "type": "preview",
+                "createdAt": 1,
+                "updatedAt": 1,
+            }
+        ],
+    )
+    respx.get("https://api.vercel.com/v1/env").mock(return_value=_empty_shared_list())
+    create = respx.post("https://api.vercel.com/v1/env").mock(
+        return_value=httpx.Response(201, json={"created": [], "failed": []})
+    )
+    dest = VercelFactory().create(_services())
+    result = await dest.apply(
+        ApplyDestinationRequest(
+            deployment_id="dep",
+            destination_config=_dest_config(),  # type: ignore[arg-type]
+            mutations=[
+                _mutation(
+                    "TEAM_STAGING",
+                    scope_kind="shared-environment",
+                    targets=["staging"],
+                    projects=["prj_a", "prj_b"],
+                )
+            ],
+        ),
+        OperationContext(correlation_id="c1"),
+    )
+    assert result.results[0].status == "applied"
+    body = json.loads(create.calls[0].request.read())
+    assert "target" not in body
+    assert set(body["customEnvironmentIds"]) == {"env_cw_staging", "env_yb_staging"}
+    assert body["projectId"] == ["prj_a", "prj_b"]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_missing_custom_env_slug_fails_with_actionable_message() -> None:
+    _mock_custom_envs("web", [])
+    respx.post("https://api.vercel.com/v10/projects/web/env").mock(
+        return_value=httpx.Response(200, json={"created": []})
+    )
+    dest = VercelFactory().create(_services())
+    result = await dest.apply(
+        ApplyDestinationRequest(
+            deployment_id="dep",
+            destination_config=_dest_config(project="web"),  # type: ignore[arg-type]
+            mutations=[_mutation("MISSING", targets=["staging"])],
+        ),
+        OperationContext(correlation_id="c1"),
+    )
+    assert result.results[0].status == "failed"
+    assert result.results[0].error is not None
+    assert "staging" in result.results[0].error.message
+    assert "web" in result.results[0].error.message
+    assert "create" in result.results[0].error.message.lower()

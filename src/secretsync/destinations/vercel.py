@@ -30,12 +30,185 @@ API_PATH = "/v10/projects/{project}/env"
 SHARED_ENV_PATH = "/v1/env"
 DEFAULT_MAX_ITEMS = 100
 SHARED_MAX_ITEMS = 50
+# Vercel REST `target` only accepts these builtins. Custom env slugs (e.g. staging)
+# must be sent as `customEnvironmentIds` after resolving via the project API.
+BUILTIN_TARGETS = frozenset({"production", "preview", "development"})
 # Vercel disallows Sensitive env vars only on Development. Custom environments
 # (e.g. staging) and production/preview all allow sensitive.
 FORBIDDEN_SENSITIVE_TARGETS = frozenset({"development"})
 SCOPE_KIND_ENVIRONMENT = "environment"
 SCOPE_KIND_SHARED = "shared-environment"
 VALID_SCOPE_KINDS = frozenset({SCOPE_KIND_ENVIRONMENT, SCOPE_KIND_SHARED})
+
+
+class CustomEnvironmentError(Exception):
+    """Raised when a custom environment slug cannot be resolved to an id."""
+
+    def __init__(self, message: str) -> None:
+        self.message = message
+        super().__init__(message)
+
+
+def _split_targets(targets: Sequence[str]) -> tuple[list[str], list[str]]:
+    """Split scope.targets into builtin target names vs custom environment slugs."""
+    builtins: list[str] = []
+    custom_slugs: list[str] = []
+    for target in targets:
+        if target in BUILTIN_TARGETS:
+            builtins.append(target)
+        else:
+            custom_slugs.append(target)
+    return builtins, custom_slugs
+
+
+def _targets_api_fields(
+    builtins: Sequence[str], custom_ids: Sequence[str]
+) -> dict[str, Any]:
+    """Build Vercel API fields satisfying anyOf(target, customEnvironmentIds)."""
+    fields: dict[str, Any] = {}
+    if builtins:
+        fields["target"] = list(builtins)
+    if custom_ids:
+        fields["customEnvironmentIds"] = list(custom_ids)
+    return fields
+
+
+def _scope_target_strings(scope: Mapping[str, JsonValue]) -> list[str]:
+    targets_raw = scope.get("targets")
+    if not isinstance(targets_raw, list):
+        return []
+    return [str(t) for t in targets_raw if isinstance(t, str)]
+
+
+def _projects_for_custom_resolve(
+    scope: Mapping[str, JsonValue],
+    *,
+    destination_project: str | None,
+) -> list[str]:
+    if _scope_kind(scope) == SCOPE_KIND_SHARED:
+        return sorted(_scope_projects(scope))
+    if destination_project:
+        return [destination_project]
+    return []
+
+
+def _remote_target_slugs(
+    item: Mapping[str, Any],
+    id_to_slug: Mapping[str, str],
+) -> set[str] | None:
+    """Normalize remote target + customEnvironmentIds to a set of yaml slugs."""
+    remote_targets = item.get("target") or item.get("targets") or []
+    if not isinstance(remote_targets, list):
+        return None
+    slugs = {str(t) for t in remote_targets}
+    custom_ids = item.get("customEnvironmentIds") or []
+    if custom_ids is None:
+        custom_ids = []
+    if not isinstance(custom_ids, list):
+        return None
+    for custom_id in custom_ids:
+        slug = id_to_slug.get(str(custom_id))
+        if slug is None:
+            return None
+        slugs.add(slug)
+    return slugs
+
+
+@dataclass
+class _CustomEnvResolver:
+    """Caches GET /v9/projects/{project}/custom-environments per project."""
+
+    client: Any
+    team_id: str
+    correlation_id: str
+    _slug_by_project: dict[str, dict[str, str]] = field(default_factory=dict)
+    _id_to_slug: dict[str, str] = field(default_factory=dict)
+    requests_made: int = 0
+
+    @property
+    def id_to_slug(self) -> Mapping[str, str]:
+        return self._id_to_slug
+
+    async def ensure_projects(self, projects: Sequence[str]) -> None:
+        for project in projects:
+            if project in self._slug_by_project:
+                continue
+            slug_to_id = await self._fetch(project)
+            self._slug_by_project[project] = slug_to_id
+            for slug, env_id in slug_to_id.items():
+                self._id_to_slug[env_id] = slug
+
+    async def _fetch(self, project: str) -> dict[str, str]:
+        url = (
+            f"{VERCEL_API}/v9/projects/{quote(project, safe='')}/custom-environments"
+        )
+        params: dict[str, str] = {"teamId": self.team_id}
+        response = await request_with_retries(
+            self.client,
+            "GET",
+            url,
+            params=params,
+            correlation_id=self.correlation_id,
+        )
+        self.requests_made += 1
+        if response.status_code != 200:
+            raise ListNamesError(
+                error_for_status(response, correlation_id=self.correlation_id)
+            )
+        payload = response.json()
+        environments = payload.get("environments") if isinstance(payload, dict) else None
+        if not isinstance(environments, list):
+            return {}
+        result: dict[str, str] = {}
+        for env in environments:
+            if not isinstance(env, dict):
+                continue
+            slug = env.get("slug")
+            env_id = env.get("id")
+            if isinstance(slug, str) and slug and isinstance(env_id, str) and env_id:
+                result[slug] = env_id
+        return result
+
+    async def resolve_ids(
+        self, projects: Sequence[str], slugs: Sequence[str]
+    ) -> list[str]:
+        """Resolve custom slugs on each project; return union of env ids."""
+        if not slugs:
+            return []
+        if not projects:
+            raise CustomEnvironmentError(
+                "custom environment targets require a project "
+                "(destination.project or scope.projects) to resolve customEnvironmentIds"
+            )
+        await self.ensure_projects(projects)
+        ids: list[str] = []
+        seen: set[str] = set()
+        for slug in slugs:
+            for project in projects:
+                env_id = self._slug_by_project[project].get(slug)
+                if env_id is None:
+                    raise CustomEnvironmentError(
+                        f"custom environment '{slug}' not found on project '{project}'; "
+                        "create it in the Vercel dashboard (Environments) before syncing"
+                    )
+                if env_id not in seen:
+                    ids.append(env_id)
+                    seen.add(env_id)
+        return ids
+
+    async def api_fields_for_scope(
+        self,
+        scope: Mapping[str, JsonValue],
+        *,
+        destination_project: str | None,
+    ) -> dict[str, Any]:
+        targets = _scope_target_strings(scope)
+        builtins, custom_slugs = _split_targets(targets)
+        custom_ids = await self.resolve_ids(
+            _projects_for_custom_resolve(scope, destination_project=destination_project),
+            custom_slugs,
+        )
+        return _targets_api_fields(builtins, custom_ids)
 
 
 def _capabilities() -> DestinationCapabilities:
@@ -124,6 +297,7 @@ def _validate_scope(
 
     git_branch = scope.get("gitBranch")
     projects = scope.get("projects")
+    _, custom_slugs = _split_targets([str(t) for t in targets])
 
     if scope_kind == SCOPE_KIND_ENVIRONMENT:
         if not destination_project:
@@ -146,6 +320,11 @@ def _validate_scope(
         or not all(isinstance(p, str) and p for p in projects)
     ):
         return "scope.projects must be a non-empty array of non-empty strings"
+    if custom_slugs and not _scope_projects(scope):
+        return (
+            "custom environment targets require scope.projects for "
+            "scope.kind=shared-environment (to resolve customEnvironmentIds per project)"
+        )
     return None
 
 
@@ -160,9 +339,12 @@ def _targets_and_type_match(
     scope: Mapping[str, JsonValue],
     *,
     kind: ValueKind,
+    id_to_slug: Mapping[str, str] | None = None,
 ) -> bool:
     """True when remote target set equals scope.targets (exact ownership).
 
+    Remote rows may store builtins in `target` and custom envs in
+    `customEnvironmentIds`; both are normalized to yaml slugs before compare.
     Overlap matching is wrong: a shared deployment with targets [production, preview]
     must not own (list/update/prune) rows that only target production or only preview.
     """
@@ -170,11 +352,8 @@ def _targets_and_type_match(
     if not isinstance(targets_raw, list):
         return False
     wanted = {str(t) for t in targets_raw}
-    remote_targets = item.get("target") or item.get("targets") or []
-    if not isinstance(remote_targets, list):
-        return False
-    remote = {str(t) for t in remote_targets}
-    if wanted != remote:
+    remote = _remote_target_slugs(item, id_to_slug or {})
+    if remote is None or wanted != remote:
         return False
     remote_type = str(item.get("type", ""))
     if kind is ValueKind.SECRET:
@@ -187,9 +366,10 @@ def _env_matches_scope(
     scope: Mapping[str, JsonValue],
     *,
     kind: ValueKind = ValueKind.SECRET,
+    id_to_slug: Mapping[str, str] | None = None,
 ) -> bool:
     """True when a remote env entry belongs to the deployment inventory unit."""
-    if not _targets_and_type_match(item, scope, kind=kind):
+    if not _targets_and_type_match(item, scope, kind=kind, id_to_slug=id_to_slug):
         return False
 
     scope_kind = _scope_kind(scope)
@@ -294,6 +474,17 @@ class VercelDestination:
         scope_kind = _scope_kind(scope)
         try:
             async with client:
+                resolver = _CustomEnvResolver(
+                    client=client,
+                    team_id=team_id,
+                    correlation_id=context.correlation_id,
+                )
+                projects = _projects_for_custom_resolve(
+                    scope, destination_project=project
+                )
+                _, custom_slugs = _split_targets(_scope_target_strings(scope))
+                if custom_slugs:
+                    await resolver.ensure_projects(projects)
                 if scope_kind == SCOPE_KIND_SHARED:
                     envs, _ = await self._list_shared_envs(
                         client, team_id=team_id, correlation_id=context.correlation_id
@@ -310,10 +501,21 @@ class VercelDestination:
             raise ListNamesError(exc.safe) from exc
         except ListNamesError:
             raise
+        except CustomEnvironmentError as exc:
+            raise ListNamesError(
+                SafeConnectorError(
+                    code="DESTINATION_INVALID",
+                    message=exc.message,
+                    correlation_id=context.correlation_id,
+                )
+            ) from exc
         names = {
             str(item["key"])
             for item in envs
-            if "key" in item and _env_matches_scope(item, scope, kind=kind)
+            if "key" in item
+            and _env_matches_scope(
+                item, scope, kind=kind, id_to_slug=resolver.id_to_slug
+            )
         }
         return frozenset(names)
 
@@ -409,6 +611,11 @@ class VercelDestination:
         results: dict[str, MutationResult] = {}
 
         async with client:
+            resolver = _CustomEnvResolver(
+                client=client,
+                team_id=team_id,
+                correlation_id=context.correlation_id,
+            )
             if env_puts or env_deletes:
                 assert project is not None
                 for chunk in _chunks(env_puts, max_items):
@@ -420,6 +627,7 @@ class VercelDestination:
                         team_id=team_id,
                         mutations=chunk,
                         correlation_id=context.correlation_id,
+                        resolver=resolver,
                     )
                     requests_made += n
                     results.update(chunk_results)
@@ -430,6 +638,7 @@ class VercelDestination:
                         team_id=team_id,
                         deletes=env_deletes,
                         correlation_id=context.correlation_id,
+                        resolver=resolver,
                     )
                     requests_made += n
                     results.update(delete_results)
@@ -440,6 +649,7 @@ class VercelDestination:
                     team_id=team_id,
                     mutations=shared_puts,
                     correlation_id=context.correlation_id,
+                    resolver=resolver,
                 )
                 requests_made += n
                 results.update(put_results)
@@ -449,9 +659,11 @@ class VercelDestination:
                     team_id=team_id,
                     deletes=shared_deletes,
                     correlation_id=context.correlation_id,
+                    resolver=resolver,
                 )
                 requests_made += n
                 results.update(delete_results)
+            requests_made += resolver.requests_made
 
         ordered = tuple(results[op.mutation_id] for op in all_ops)
         return ApplyDestinationResult(results=ordered, requests_made=requests_made)
@@ -464,21 +676,56 @@ class VercelDestination:
         team_id: str,
         mutations: Sequence[PutMutation],
         correlation_id: str,
+        resolver: _CustomEnvResolver,
     ) -> tuple[dict[str, MutationResult], int]:
         payload = []
+        ready: list[PutMutation] = []
+        early_failures: dict[str, MutationResult] = {}
         for mutation in mutations:
             scope = dict(mutation.scopes[0])
-            targets_raw = scope["targets"]
-            assert isinstance(targets_raw, list)
+            try:
+                target_fields = await resolver.api_fields_for_scope(
+                    scope, destination_project=project
+                )
+            except CustomEnvironmentError as exc:
+                early_failures[mutation.mutation_id] = MutationResult(
+                    mutation_id=mutation.mutation_id,
+                    status="failed",
+                    error=SafeConnectorError(
+                        code="DESTINATION_INVALID",
+                        message=exc.message,
+                        mutation_id=mutation.mutation_id,
+                        correlation_id=correlation_id,
+                    ),
+                )
+                continue
+            except ListNamesError as exc:
+                early_failures[mutation.mutation_id] = MutationResult(
+                    mutation_id=mutation.mutation_id,
+                    status="failed",
+                    error=exc.safe,
+                )
+                continue
+            except HttpRequestError as exc:
+                early_failures[mutation.mutation_id] = MutationResult(
+                    mutation_id=mutation.mutation_id,
+                    status="failed",
+                    error=exc.safe,
+                )
+                continue
             entry: dict[str, Any] = {
                 "key": mutation.name,
                 "value": bytes(mutation.value).decode("utf-8"),
                 "type": _env_type(mutation.kind),
-                "target": [str(t) for t in targets_raw],
+                **target_fields,
             }
             if scope.get("gitBranch"):
                 entry["gitBranch"] = scope["gitBranch"]
             payload.append(entry)
+            ready.append(mutation)
+
+        if not ready:
+            return early_failures, 0
 
         params: dict[str, str] = {"upsert": "true", "teamId": team_id}
         url = f"{VERCEL_API}{API_PATH.format(project=quote(project, safe=''))}"
@@ -495,18 +742,21 @@ class VercelDestination:
         except HttpRequestError as exc:
             return (
                 {
-                    m.mutation_id: MutationResult(
-                        mutation_id=m.mutation_id,
-                        status="failed",
-                        error=SafeConnectorError(
-                            code=exc.safe.code,
-                            message=exc.safe.message,
+                    **early_failures,
+                    **{
+                        m.mutation_id: MutationResult(
                             mutation_id=m.mutation_id,
-                            correlation_id=correlation_id,
-                            retryable=exc.safe.retryable,
-                        ),
-                    )
-                    for m in mutations
+                            status="failed",
+                            error=SafeConnectorError(
+                                code=exc.safe.code,
+                                message=exc.safe.message,
+                                mutation_id=m.mutation_id,
+                                correlation_id=correlation_id,
+                                retryable=exc.safe.retryable,
+                            ),
+                        )
+                        for m in ready
+                    },
                 },
                 1,
             )
@@ -514,12 +764,15 @@ class VercelDestination:
         if response.status_code in {200, 201}:
             return (
                 {
-                    m.mutation_id: MutationResult(
-                        mutation_id=m.mutation_id,
-                        status="applied",
-                        effect="upserted",
-                    )
-                    for m in mutations
+                    **early_failures,
+                    **{
+                        m.mutation_id: MutationResult(
+                            mutation_id=m.mutation_id,
+                            status="applied",
+                            effect="upserted",
+                        )
+                        for m in ready
+                    },
                 },
                 1,
             )
@@ -529,30 +782,34 @@ class VercelDestination:
                 client,
                 project=project,
                 team_id=team_id,
-                mutations=mutations,
+                mutations=ready,
                 correlation_id=correlation_id,
+                resolver=resolver,
             )
-            return edited, 1 + n
+            return {**early_failures, **edited}, 1 + n
 
         err = error_for_status(
             response,
             correlation_id=correlation_id,
-            secrets=[bytes(m.value).decode("utf-8", errors="replace") for m in mutations],
+            secrets=[bytes(m.value).decode("utf-8", errors="replace") for m in ready],
         )
         return (
             {
-                m.mutation_id: MutationResult(
-                    mutation_id=m.mutation_id,
-                    status="failed",
-                    error=SafeConnectorError(
-                        code=err.code,
-                        message=err.message,
+                **early_failures,
+                **{
+                    m.mutation_id: MutationResult(
                         mutation_id=m.mutation_id,
-                        correlation_id=correlation_id,
-                        retryable=err.retryable,
-                    ),
-                )
-                for m in mutations
+                        status="failed",
+                        error=SafeConnectorError(
+                            code=err.code,
+                            message=err.message,
+                            mutation_id=m.mutation_id,
+                            correlation_id=correlation_id,
+                            retryable=err.retryable,
+                        ),
+                    )
+                    for m in ready
+                },
             },
             1,
         )
@@ -609,8 +866,16 @@ class VercelDestination:
         team_id: str,
         mutations: Sequence[PutMutation],
         correlation_id: str,
+        resolver: _CustomEnvResolver,
     ) -> tuple[dict[str, MutationResult], int]:
         try:
+            for mutation in mutations:
+                scope = dict(mutation.scopes[0])
+                _, custom_slugs = _split_targets(_scope_target_strings(scope))
+                if custom_slugs:
+                    await resolver.ensure_projects(
+                        _projects_for_custom_resolve(scope, destination_project=None)
+                    )
             envs, list_requests = await self._list_shared_envs(
                 client, team_id=team_id, correlation_id=correlation_id
             )
@@ -638,6 +903,23 @@ class VercelDestination:
                 },
                 1,
             )
+        except CustomEnvironmentError as exc:
+            return (
+                {
+                    m.mutation_id: MutationResult(
+                        mutation_id=m.mutation_id,
+                        status="failed",
+                        error=SafeConnectorError(
+                            code="DESTINATION_INVALID",
+                            message=exc.message,
+                            mutation_id=m.mutation_id,
+                            correlation_id=correlation_id,
+                        ),
+                    )
+                    for m in mutations
+                },
+                0,
+            )
 
         to_update: list[tuple[PutMutation, str]] = []
         to_create: list[PutMutation] = []
@@ -646,7 +928,10 @@ class VercelDestination:
             env_id: str | None = None
             for item in envs:
                 if item.get("key") == mutation.name and _env_matches_scope(
-                    item, scope, kind=mutation.kind
+                    item,
+                    scope,
+                    kind=mutation.kind,
+                    id_to_slug=resolver.id_to_slug,
                 ):
                     env_id = str(item.get("id", "")) or None
                     break
@@ -664,17 +949,16 @@ class VercelDestination:
                 team_id=team_id,
                 updates=update_chunk,
                 correlation_id=correlation_id,
+                resolver=resolver,
             )
             requests += n
             results.update(chunk_results)
 
-        # Create batches share type + target + projectId at the request level.
+        # Create batches share type + logical targets + projectId at the request level.
         groups: dict[tuple[str, tuple[str, ...], tuple[str, ...]], list[PutMutation]] = {}
         for mutation in to_create:
             scope = dict(mutation.scopes[0])
-            targets_raw = scope["targets"]
-            assert isinstance(targets_raw, list)
-            targets = tuple(sorted(str(t) for t in targets_raw))
+            targets = tuple(sorted(_scope_target_strings(scope)))
             projects = tuple(sorted(_scope_projects(scope)))
             key = (_env_type(mutation.kind), targets, projects)
             groups.setdefault(key, []).append(mutation)
@@ -689,6 +973,7 @@ class VercelDestination:
                     targets=list(targets),
                     projects=list(projects),
                     correlation_id=correlation_id,
+                    resolver=resolver,
                 )
                 requests += n
                 results.update(chunk_results)
@@ -705,7 +990,52 @@ class VercelDestination:
         targets: list[str],
         projects: list[str],
         correlation_id: str,
+        resolver: _CustomEnvResolver,
     ) -> tuple[dict[str, MutationResult], int]:
+        builtins, custom_slugs = _split_targets(targets)
+        try:
+            custom_ids = await resolver.resolve_ids(projects, custom_slugs)
+        except CustomEnvironmentError as exc:
+            return (
+                {
+                    m.mutation_id: MutationResult(
+                        mutation_id=m.mutation_id,
+                        status="failed",
+                        error=SafeConnectorError(
+                            code="DESTINATION_INVALID",
+                            message=exc.message,
+                            mutation_id=m.mutation_id,
+                            correlation_id=correlation_id,
+                        ),
+                    )
+                    for m in mutations
+                },
+                0,
+            )
+        except ListNamesError as exc:
+            return (
+                {
+                    m.mutation_id: MutationResult(
+                        mutation_id=m.mutation_id,
+                        status="failed",
+                        error=exc.safe,
+                    )
+                    for m in mutations
+                },
+                0,
+            )
+        except HttpRequestError as exc:
+            return (
+                {
+                    m.mutation_id: MutationResult(
+                        mutation_id=m.mutation_id,
+                        status="failed",
+                        error=exc.safe,
+                    )
+                    for m in mutations
+                },
+                0,
+            )
         body: dict[str, Any] = {
             "evs": [
                 {
@@ -715,7 +1045,7 @@ class VercelDestination:
                 for m in mutations
             ],
             "type": env_type,
-            "target": targets,
+            **_targets_api_fields(builtins, custom_ids),
         }
         if projects:
             body["projectId"] = projects
@@ -790,21 +1120,53 @@ class VercelDestination:
         team_id: str,
         updates: Sequence[tuple[PutMutation, str]],
         correlation_id: str,
+        resolver: _CustomEnvResolver,
     ) -> tuple[dict[str, MutationResult], int]:
         payload_updates: dict[str, Any] = {}
+        early_failures: dict[str, MutationResult] = {}
         for mutation, env_id in updates:
             scope = dict(mutation.scopes[0])
-            targets_raw = scope["targets"]
-            assert isinstance(targets_raw, list)
+            try:
+                target_fields = await resolver.api_fields_for_scope(
+                    scope, destination_project=None
+                )
+            except CustomEnvironmentError as exc:
+                early_failures[mutation.mutation_id] = MutationResult(
+                    mutation_id=mutation.mutation_id,
+                    status="failed",
+                    error=SafeConnectorError(
+                        code="DESTINATION_INVALID",
+                        message=exc.message,
+                        mutation_id=mutation.mutation_id,
+                        correlation_id=correlation_id,
+                    ),
+                )
+                continue
+            except ListNamesError as exc:
+                early_failures[mutation.mutation_id] = MutationResult(
+                    mutation_id=mutation.mutation_id,
+                    status="failed",
+                    error=exc.safe,
+                )
+                continue
+            except HttpRequestError as exc:
+                early_failures[mutation.mutation_id] = MutationResult(
+                    mutation_id=mutation.mutation_id,
+                    status="failed",
+                    error=exc.safe,
+                )
+                continue
             entry: dict[str, Any] = {
                 "value": bytes(mutation.value).decode("utf-8"),
                 "type": _env_type(mutation.kind),
-                "target": [str(t) for t in targets_raw],
+                **target_fields,
             }
             projects = sorted(_scope_projects(scope))
             if projects:
                 entry["projectId"] = projects
             payload_updates[env_id] = entry
+        if not payload_updates:
+            return early_failures, 0
         url = f"{VERCEL_API}{SHARED_ENV_PATH}"
         params = {"teamId": team_id}
         try:
@@ -819,52 +1181,68 @@ class VercelDestination:
         except HttpRequestError as exc:
             return (
                 {
-                    m.mutation_id: MutationResult(
-                        mutation_id=m.mutation_id,
-                        status="failed",
-                        error=SafeConnectorError(
-                            code=exc.safe.code,
-                            message=exc.safe.message,
+                    **early_failures,
+                    **{
+                        m.mutation_id: MutationResult(
                             mutation_id=m.mutation_id,
-                            correlation_id=correlation_id,
-                            retryable=exc.safe.retryable,
-                        ),
-                    )
-                    for m, _ in updates
+                            status="failed",
+                            error=SafeConnectorError(
+                                code=exc.safe.code,
+                                message=exc.safe.message,
+                                mutation_id=m.mutation_id,
+                                correlation_id=correlation_id,
+                                retryable=exc.safe.retryable,
+                            ),
+                        )
+                        for m, _ in updates
+                        if m.mutation_id not in early_failures
+                    },
                 },
                 1,
             )
         if response.status_code in {200, 201}:
             return (
                 {
-                    m.mutation_id: MutationResult(
-                        mutation_id=m.mutation_id,
-                        status="applied",
-                        effect="updated",
-                    )
-                    for m, _ in updates
+                    **early_failures,
+                    **{
+                        m.mutation_id: MutationResult(
+                            mutation_id=m.mutation_id,
+                            status="applied",
+                            effect="updated",
+                        )
+                        for m, _ in updates
+                        if m.mutation_id not in early_failures
+                    },
                 },
                 1,
             )
         err = error_for_status(
             response,
             correlation_id=correlation_id,
-            secrets=[bytes(m.value).decode("utf-8", errors="replace") for m, _ in updates],
+            secrets=[
+                bytes(m.value).decode("utf-8", errors="replace")
+                for m, _ in updates
+                if m.mutation_id not in early_failures
+            ],
         )
         return (
             {
-                m.mutation_id: MutationResult(
-                    mutation_id=m.mutation_id,
-                    status="failed",
-                    error=SafeConnectorError(
-                        code=err.code,
-                        message=err.message,
+                **early_failures,
+                **{
+                    m.mutation_id: MutationResult(
                         mutation_id=m.mutation_id,
-                        correlation_id=correlation_id,
-                        retryable=err.retryable,
-                    ),
-                )
-                for m, _ in updates
+                        status="failed",
+                        error=SafeConnectorError(
+                            code=err.code,
+                            message=err.message,
+                            mutation_id=m.mutation_id,
+                            correlation_id=correlation_id,
+                            retryable=err.retryable,
+                        ),
+                    )
+                    for m, _ in updates
+                    if m.mutation_id not in early_failures
+                },
             },
             1,
         )
@@ -876,8 +1254,16 @@ class VercelDestination:
         team_id: str,
         deletes: Sequence[DeleteMutation],
         correlation_id: str,
+        resolver: _CustomEnvResolver,
     ) -> tuple[dict[str, MutationResult], int]:
         try:
+            for deletion in deletes:
+                scope = dict(deletion.scopes[0])
+                _, custom_slugs = _split_targets(_scope_target_strings(scope))
+                if custom_slugs:
+                    await resolver.ensure_projects(
+                        _projects_for_custom_resolve(scope, destination_project=None)
+                    )
             envs, list_requests = await self._list_shared_envs(
                 client, team_id=team_id, correlation_id=correlation_id
             )
@@ -905,6 +1291,23 @@ class VercelDestination:
                 },
                 1,
             )
+        except CustomEnvironmentError as exc:
+            return (
+                {
+                    d.mutation_id: MutationResult(
+                        mutation_id=d.mutation_id,
+                        status="failed",
+                        error=SafeConnectorError(
+                            code="DESTINATION_INVALID",
+                            message=exc.message,
+                            mutation_id=d.mutation_id,
+                            correlation_id=correlation_id,
+                        ),
+                    )
+                    for d in deletes
+                },
+                0,
+            )
 
         results: dict[str, MutationResult] = {}
         pending: list[tuple[DeleteMutation, str]] = []
@@ -913,7 +1316,10 @@ class VercelDestination:
             env_id: str | None = None
             for item in envs:
                 if item.get("key") == deletion.name and _env_matches_scope(
-                    item, scope, kind=deletion.kind
+                    item,
+                    scope,
+                    kind=deletion.kind,
+                    id_to_slug=resolver.id_to_slug,
                 ):
                     env_id = str(item.get("id", "")) or None
                     break
@@ -981,8 +1387,14 @@ class VercelDestination:
         team_id: str,
         deletes: Sequence[DeleteMutation],
         correlation_id: str,
+        resolver: _CustomEnvResolver,
     ) -> tuple[dict[str, MutationResult], int]:
         try:
+            for deletion in deletes:
+                scope = dict(deletion.scopes[0])
+                _, custom_slugs = _split_targets(_scope_target_strings(scope))
+                if custom_slugs:
+                    await resolver.ensure_projects([project])
             envs, list_requests = await self._list_envs(
                 client, project=project, team_id=team_id, correlation_id=correlation_id
             )
@@ -1010,6 +1422,23 @@ class VercelDestination:
                 },
                 1,
             )
+        except CustomEnvironmentError as exc:
+            return (
+                {
+                    d.mutation_id: MutationResult(
+                        mutation_id=d.mutation_id,
+                        status="failed",
+                        error=SafeConnectorError(
+                            code="DESTINATION_INVALID",
+                            message=exc.message,
+                            mutation_id=d.mutation_id,
+                            correlation_id=correlation_id,
+                        ),
+                    )
+                    for d in deletes
+                },
+                0,
+            )
 
         results: dict[str, MutationResult] = {}
         requests = list_requests
@@ -1018,7 +1447,10 @@ class VercelDestination:
             env_id: str | None = None
             for item in envs:
                 if item.get("key") == deletion.name and _env_matches_scope(
-                    item, scope, kind=deletion.kind
+                    item,
+                    scope,
+                    kind=deletion.kind,
+                    id_to_slug=resolver.id_to_slug,
                 ):
                     env_id = str(item.get("id", "")) or None
                     break
@@ -1077,6 +1509,7 @@ class VercelDestination:
         team_id: str,
         mutations: Sequence[PutMutation],
         correlation_id: str,
+        resolver: _CustomEnvResolver,
     ) -> tuple[dict[str, MutationResult], int]:
         """Retrieve env metadata and PATCH each conflicting key."""
         try:
@@ -1122,7 +1555,12 @@ class VercelDestination:
             for item in envs:
                 if item.get("key") != mutation.name:
                     continue
-                if _env_matches_scope(item, scope, kind=mutation.kind):
+                if _env_matches_scope(
+                    item,
+                    scope,
+                    kind=mutation.kind,
+                    id_to_slug=resolver.id_to_slug,
+                ):
                     env_id = str(item.get("id", "")) or None
                     break
             if env_id is None:
@@ -1142,12 +1580,40 @@ class VercelDestination:
             edit_url = (
                 f"{VERCEL_API}/v9/projects/{quote(project, safe='')}/env/{quote(env_id, safe='')}"
             )
-            targets_raw = scope["targets"]
-            assert isinstance(targets_raw, list)
+            try:
+                target_fields = await resolver.api_fields_for_scope(
+                    scope, destination_project=project
+                )
+            except CustomEnvironmentError as exc:
+                results[mutation.mutation_id] = MutationResult(
+                    mutation_id=mutation.mutation_id,
+                    status="failed",
+                    error=SafeConnectorError(
+                        code="DESTINATION_INVALID",
+                        message=exc.message,
+                        mutation_id=mutation.mutation_id,
+                        correlation_id=correlation_id,
+                    ),
+                )
+                continue
+            except ListNamesError as exc:
+                results[mutation.mutation_id] = MutationResult(
+                    mutation_id=mutation.mutation_id,
+                    status="failed",
+                    error=exc.safe,
+                )
+                continue
+            except HttpRequestError as exc:
+                results[mutation.mutation_id] = MutationResult(
+                    mutation_id=mutation.mutation_id,
+                    status="failed",
+                    error=exc.safe,
+                )
+                continue
             body = {
                 "value": bytes(mutation.value).decode("utf-8"),
                 "type": _env_type(mutation.kind),
-                "target": [str(t) for t in targets_raw],
+                **target_fields,
             }
             edit_params: dict[str, str] = {"teamId": team_id}
             try:
@@ -1211,7 +1677,7 @@ class VercelFactory:
     manifest: DestinationManifest = field(
         default_factory=lambda: DestinationManifest(
             id="vercel",
-            version="0.2.0+shared-env",
+            version="0.3.0+custom-env",
             capabilities=_capabilities(),
         )
     )

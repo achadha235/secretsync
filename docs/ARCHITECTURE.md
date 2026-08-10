@@ -65,7 +65,9 @@ With `--prune` on `plan` / `apply` (or the TUI prune checkbox):
 
 There is no local last-applied state file — every prune plan reflects the live remote inventory. Auth/list failures fail the plan; they are not skipped. Connectors without `list_names` + delete support refuse prune with a clear error.
 
-Vercel ownership is exact target-set equality (`scope.targets` == remote `target`), for both `environment` and `shared-environment`. Overlap matching would let a multi-target inventory unit prune sibling single-target rows.
+Vercel ownership is exact target-set equality on normalized slugs (`scope.targets` == remote builtins ∪ custom-env slugs), for both `environment` and `shared-environment`. Yaml may list builtin targets (`production` / `preview` / `development`) and/or custom environment **slugs**; the connector resolves slugs to `customEnvironmentIds` (shared env: resolve on each `scope.projects` entry and union IDs). Overlap matching would let a multi-target inventory unit prune sibling single-target rows.
+
+SST ownership splits `sst secret list` stdout by section: `# fallback` keys belong only to inventory units with `scope.fallback: true`; `# <app>/<stage>` (and flat/headerless output) belong to `fallback: false`. Deletes inherit that flag so fallback orphans are removed with `secret remove --fallback`. When prune selects any SST deployment, plan synthesis adds a fallback secret inventory unit for that destination (intended names from explicit `fallback: true` deployments, else empty) so orphaned fallbacks are reconciled even without a fallback deployment in YAML.
 
 ## Connector boundary
 
