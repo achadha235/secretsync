@@ -44,6 +44,12 @@ destinations:
     connector: sst
     workingDirectory: .
     executable: sst
+  # Requires: pip/uv install 'secretsync-cli[aws]' (or [all])
+  # ssm:
+  #   connector: aws-ssm
+  #   region: us-east-1
+  #   # keyId: alias/aws/ssm
+  #   # tier: Standard
 
 deployments:
   - name: github-production
@@ -92,6 +98,16 @@ deployments:
     secrets:
       secretOneStaging: SecretOne
       secretTwoCommon: SecretTwo
+  # - name: ssm-production
+  #   set: production
+  #   destination: ssm
+  #   scope:
+  #     pathPrefix: /myapp/production
+  #   secrets:
+  #     secretOneProd: API_KEY
+  #   variables:
+  #     # top-level variables: map to Parameter Store String type
+  #     # logLevel: LOG_LEVEL
 """
 
 ENV_SECRETSYNC_TPL = """\

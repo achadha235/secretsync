@@ -7,7 +7,7 @@ license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "SecretSync contributors" }]
 requires-python = ">=3.12"
-keywords = ["secrets", "github-actions", "vercel", "sst", "1password", "cli"]
+keywords = ["secrets", "github-actions", "vercel", "sst", "aws", "ssm", "1password", "cli"]
 classifiers = [
   "Development Status :: 2 - Pre-Alpha",
   "Environment :: Console",
@@ -29,6 +29,10 @@ dependencies = [
   "anyio>=4.9,<5",
   "loguru>=0.7.3",
 ]
+
+[project.optional-dependencies]
+aws = ["boto3>=1.35,<2"]
+all = ["secretsync-cli[aws]"]
 
 [project.urls]
 Homepage = "https://github.com/achadha235/secretsync"
@@ -61,6 +65,7 @@ dev = [
   "ruff>=0.12,<1",
   "mypy>=1.17,<2",
   "types-pyyaml>=6.0.12",
+  "boto3>=1.35,<2",
 ]
 
 [tool.uv]

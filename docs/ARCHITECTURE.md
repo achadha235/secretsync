@@ -20,10 +20,10 @@ This document describes how SecretSync is structured and how secrets move — es
               |
     validate -> plan -> apply
               |
-     +--------+--------+--------+
-     |        |        |        |
-   GitHub   Vercel    SST     fakes
-   (HTTPS)  (HTTPS)  (process)
+     +--------+--------+--------+--------+
+     |        |        |        |        |
+   GitHub   Vercel    SST    aws-ssm   fakes
+   (HTTPS)  (HTTPS) (process) (boto3)
 ```
 
 Both Click and Textual use the same [`AppServices`](../src/secretsync/application/services.py) composition root. There is no second plan/apply implementation.
@@ -35,7 +35,7 @@ Both Click and Textual use the same [`AppServices`](../src/secretsync/applicatio
 | `config/` | Pydantic YAML schema + loader + set composition |
 | `application/` | validate, plan, apply coordinator |
 | `sources/` | Environment secret source |
-| `destinations/` | Connector protocol, registry, GitHub/Vercel/SST/fakes |
+| `destinations/` | Connector protocol, registry, GitHub/Vercel/SST/aws-ssm/fakes |
 | `infrastructure/` | HTTP client, process runner, dotenv encoder, redaction |
 | `presentation/` | Human + versioned JSON renderers (value-free) |
 | `tui/` | Textual screens + CSS |
