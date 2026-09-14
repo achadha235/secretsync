@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from secretsync.application.apply import run_clear
 from secretsync.application.plan import (
+    _inventory_units,
     build_clear_plan_async,
     build_plan,
     build_plan_async,
@@ -15,7 +18,13 @@ from secretsync.config.compose import compose_from_config
 from secretsync.config.loader import ConfigLoader
 from secretsync.destinations.base import OperationContext
 from secretsync.destinations.fake import FakePruneFactory, _scope_key
-from secretsync.destinations.sst import parse_sst_secret_list_names
+from secretsync.destinations.sst import (
+    SstFactory,
+    parse_sst_secret_list_names,
+    parse_sst_secret_list_sections,
+)
+from secretsync.domain.models import ValueKind
+from secretsync.infrastructure.process import AsyncSecureProcessRunner, ProcessResult
 from tests.conftest import fixture_path
 
 PRUNE_ENV = {
@@ -208,6 +217,126 @@ def test_parse_sst_secret_list_names_dotenv_and_table() -> None:
     table = b"Name\nALPHA\nBETA value-here\n"
     assert "ALPHA" in parse_sst_secret_list_names(table)
     assert "BETA" in parse_sst_secret_list_names(table)
+
+
+def test_parse_sst_secret_list_sections_fallback_vs_stage() -> None:
+    stdout = b"""# fallback
+TEST_SECRET=meow
+
+# yellowbrick/staging
+STRIPE_API_KEY=meow
+DISCORD_BOT_TOKEN=meow
+YB_DATABASE_URL=meow
+"""
+    stage, fallback = parse_sst_secret_list_sections(stdout)
+    assert fallback == frozenset({"TEST_SECRET"})
+    assert stage == frozenset(
+        {"STRIPE_API_KEY", "DISCORD_BOT_TOKEN", "YB_DATABASE_URL"}
+    )
+    assert parse_sst_secret_list_names(stdout) == stage | fallback
+
+
+def test_parse_sst_secret_list_sections_flat_is_stage() -> None:
+    stage, fallback = parse_sst_secret_list_sections(b'FOO="bar"\nBAZ=qux\n')
+    assert stage == frozenset({"FOO", "BAZ"})
+    assert fallback == frozenset()
+
+
+def test_inventory_units_synthesizes_sst_fallback_for_prune() -> None:
+    """Stage-only SST YAML still gets a fallback inventory unit (empty intended)."""
+    config = ConfigLoader().load(fixture_path("valid_full.yaml"))
+    selected = [d for d in config.deployments if d.destination == "sst"]
+    assert selected
+    units = _inventory_units(config, selected)
+    fallback_units = [
+        u
+        for u in units
+        if u.destination_id == "sst"
+        and u.kind is ValueKind.SECRET
+        and bool(u.scope.get("fallback"))
+    ]
+    assert len(fallback_units) == 1
+    assert fallback_units[0].intended_names == frozenset()
+    assert fallback_units[0].scope.get("stage") == "production"
+
+
+@pytest.mark.asyncio
+async def test_prune_plans_sst_fallback_orphan_deletes(tmp_path: Path) -> None:
+    """Orphaned fallback secrets are planned for delete with fallback: true scope."""
+
+    class _ListRunner(AsyncSecureProcessRunner):
+        async def execute(self, request):  # type: ignore[no-untyped-def]
+            args = list(request.arguments)
+            if "list" in args and "--fallback" in args:
+                stdout = b"# fallback\nTEST_SECRET=meow\n"
+            elif "list" in args:
+                stdout = b"# app/production\nDatabaseUrl=x\nStripeSecretKey=y\n"
+            else:
+                stdout = b""
+            return ProcessResult(
+                exit_code=0,
+                duration_ms=1,
+                stdout_bytes=stdout,
+                stderr_summary="",
+            )
+
+    cfg_path = tmp_path / "secretsync.yaml"
+    cfg_path.write_text(
+        f"""
+version: 1
+changeDetection: always-write
+secrets:
+  databaseUrl:
+    env: YB_DATABASE_URL
+  stripeSecretKey:
+    env: STRIPE_SECRET_KEY
+sets:
+  production:
+    include: [databaseUrl, stripeSecretKey]
+destinations:
+  sst:
+    connector: sst
+    workingDirectory: "{tmp_path.as_posix()}"
+    executable: sst
+deployments:
+  - name: sst-production
+    set: production
+    destination: sst
+    scope:
+      stage: production
+      fallback: false
+    secrets:
+      databaseUrl: DatabaseUrl
+      stripeSecretKey: StripeSecretKey
+""",
+        encoding="utf-8",
+    )
+
+    services = create_services(PRUNE_ENV)
+    original = SstFactory.create
+
+    def _create(self, services_arg):  # type: ignore[no-untyped-def]
+        dest = original(self, services_arg)
+        dest.process_runner = _ListRunner()
+        dest._resolved_executable = Path("/usr/bin/true")
+        dest._argv_prefix = ()
+        dest._probe_ok = False
+        return dest
+
+    SstFactory.create = _create  # type: ignore[method-assign]
+    try:
+        config = ConfigLoader().load(cfg_path)
+        composed = compose_from_config(config)
+        plan = await build_plan_async(services, config, composed, prune=True)
+    finally:
+        SstFactory.create = original  # type: ignore[method-assign]
+
+    fallback_deletes = [
+        d for d in plan.deletes if d.target.scope.get("fallback") is True
+    ]
+    assert len(fallback_deletes) == 1
+    assert fallback_deletes[0].target.name == "TEST_SECRET"
+    assert fallback_deletes[0].target.scope.get("fallback") is True
 
 
 def test_build_plan_still_sync_put_only() -> None:

@@ -76,25 +76,62 @@ def _parse_scope(scope: Mapping[str, JsonValue]) -> tuple[str, bool] | None:
     return stage.strip(), bool(scope.get("fallback", False))
 
 
-def parse_sst_secret_list_names(stdout: bytes) -> frozenset[str]:
-    """Extract secret names from `sst secret list` stdout; discard values immediately."""
-    names: set[str] = set()
+def _extract_secret_name(line: str) -> str | None:
+    """Parse one non-comment list line into a secret name; discard values."""
+    lower = line.lower()
+    if lower in {"name", "names", "secret", "secrets"} or set(line) <= {"-", "─", "|", " "}:
+        return None
+    if "=" in line:
+        key = line.split("=", 1)[0].strip()
+        return key or None
+    parts = line.split()
+    return parts[0] if parts else None
+
+
+def parse_sst_secret_list_sections(stdout: bytes) -> tuple[frozenset[str], frozenset[str]]:
+    """Return (stage_names, fallback_names) from `sst secret list` stdout.
+
+    SST stage lists often print both a ``# fallback`` section and a
+    ``# <app>/<stage>`` section. Keys before any section header are treated as
+    stage names (flat dotenv / table output).
+    """
+    stage_names: set[str] = set()
+    fallback_names: set[str] = set()
+    # None = no header yet → stage (backward compatible with flat output)
+    in_fallback: bool | None = None
+
     for raw_line in stdout.splitlines():
         line = raw_line.decode("utf-8", errors="replace").strip()
-        if not line or line.startswith("#"):
+        if not line:
             continue
-        lower = line.lower()
-        if lower in {"name", "names", "secret", "secrets"} or set(line) <= {"-", "─", "|", " "}:
+        if line.startswith("#"):
+            header = line[1:].strip().lower()
+            if header == "fallback":
+                in_fallback = True
+            elif header:
+                # e.g. "# yellowbrick/staging" or other stage section labels
+                in_fallback = False
             continue
-        if "=" in line:
-            key = line.split("=", 1)[0].strip()
-            if key:
-                names.add(key)
+        name = _extract_secret_name(line)
+        if name is None:
             continue
-        parts = line.split()
-        if parts:
-            names.add(parts[0])
-    return frozenset(names)
+        if in_fallback is True:
+            fallback_names.add(name)
+        else:
+            stage_names.add(name)
+    return frozenset(stage_names), frozenset(fallback_names)
+
+
+def parse_sst_secret_list_names(stdout: bytes) -> frozenset[str]:
+    """Extract all secret names from `sst secret list` stdout (stage ∪ fallback)."""
+    stage_names, fallback_names = parse_sst_secret_list_sections(stdout)
+    return frozenset(stage_names | fallback_names)
+
+
+def _sst_list_empty_inventory(stderr_summary: str, stdout_bytes: bytes) -> bool:
+    """True when SST reports an empty secret list (non-zero exit, not a real failure)."""
+    combined = f"{stderr_summary}\n{stdout_bytes.decode('utf-8', errors='replace')}"
+    return "no secrets found" in combined.lower()
 
 
 @dataclass
@@ -204,6 +241,10 @@ class SstDestination:
         except ProcessRunnerError as exc:
             raise ListNamesError(exc.safe) from exc
         if result.exit_code != 0:
+            # SST exits non-zero when the inventory is empty ("No secrets found"),
+            # including for --fallback after orphans were removed. Treat as empty.
+            if _sst_list_empty_inventory(result.stderr_summary, result.stdout_bytes):
+                return frozenset()
             raise ListNamesError(
                 SafeConnectorError(
                     code="PROCESS_FAILED",
@@ -212,9 +253,10 @@ class SstDestination:
                     hint=result.stderr_summary or None,
                 )
             )
-        names = parse_sst_secret_list_names(result.stdout_bytes)
+        stage_names, fallback_names = parse_sst_secret_list_sections(result.stdout_bytes)
         del result
-        return names
+        # Stage lists include a # fallback section; only return names owned by this scope.
+        return fallback_names if fallback else stage_names
 
     async def apply(
         self,

@@ -269,7 +269,70 @@ def _inventory_units(
                 intended_names=frozenset(bucket["intended_names"]),
             )
         )
-    return units
+    return _ensure_sst_fallback_prune_units(config, selected, units)
+
+
+def _ensure_sst_fallback_prune_units(
+    config: RootConfig,
+    selected: list[DeploymentDefinition],
+    units: list[_InventoryUnit],
+) -> list[_InventoryUnit]:
+    """Ensure each selected SST destination has a fallback secret inventory unit.
+
+    Stage lists omit ``# fallback`` keys (owned separately). Without an explicit
+    ``fallback: true`` deployment, prune would never see orphaned fallbacks.
+    Synthesize a unit with intended names from any fallback deployments (often
+    empty) so ``remote - intended`` deletes leftovers via ``secret remove --fallback``.
+    """
+    sst_deps: dict[str, list[DeploymentDefinition]] = {}
+    for deployment in selected:
+        destination = config.destinations[deployment.destination]
+        if destination.connector != "sst":
+            continue
+        sst_deps.setdefault(deployment.destination, []).append(deployment)
+
+    if not sst_deps:
+        return units
+
+    result = list(units)
+    for destination_id, deps in sst_deps.items():
+        if any(
+            u.destination_id == destination_id
+            and u.kind is ValueKind.SECRET
+            and bool(u.scope.get("fallback"))
+            for u in result
+        ):
+            continue
+
+        intended: set[str] = set()
+        stage: str | None = None
+        owner: str | None = None
+        for deployment in deps:
+            raw_stage = deployment.scope.get("stage")
+            if stage is None and isinstance(raw_stage, str) and raw_stage.strip():
+                stage = raw_stage.strip()
+                owner = deployment.name
+            if bool(deployment.scope.get("fallback")):
+                intended.update(deployment.secrets.values())
+                if owner is None:
+                    owner = deployment.name
+        if stage is None or owner is None:
+            continue
+
+        scope: dict[str, JsonValue] = {"stage": stage, "fallback": True}
+        destination = config.destinations[destination_id]
+        result.append(
+            _InventoryUnit(
+                destination_id=destination_id,
+                connector_id=destination.connector,
+                scope=scope,
+                scope_key=freeze_scope_key(scope),
+                kind=ValueKind.SECRET,
+                deployment_ids=(owner,),
+                intended_names=frozenset(intended),
+            )
+        )
+    return result
 
 
 def freeze_scope_key(scope: Mapping[str, JsonValue]) -> str:
